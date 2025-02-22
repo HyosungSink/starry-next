@@ -1,4 +1,4 @@
-AX_ROOT ?= $(PWD)/.arceos
+AX_ROOT ?= $(PWD)/arceos
 AX_TESTCASE ?= nimbos
 ARCH ?= x86_64
 AX_TESTCASES_LIST=$(shell cat ./apps/$(AX_TESTCASE)/testcase_list | tr '\n' ',')
@@ -48,6 +48,7 @@ user_apps:
 test:
 	@./scripts/app_test.sh
 
+# Build kernel in the oscomp docker container
 test_build: ax_root
 	@cp -r $(PWD)/bin/* /root/.cargo/bin
 	@rustup override set nightly-2025-01-18
