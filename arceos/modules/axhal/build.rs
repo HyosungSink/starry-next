@@ -66,6 +66,13 @@ fn gen_linker_script(arch: &str, platform: &str) -> Result<()> {
         "%KERNEL_BASE%",
         &format!("{:#x}", axconfig::plat::KERNEL_BASE_VADDR),
     );
+    let ld_content = ld_content.replace(
+        "%KERNEL_OFFSET%",
+        &format!(
+            "{:#x}",
+            axconfig::plat::KERNEL_BASE_VADDR - axconfig::plat::KERNEL_BASE_PADDR
+        ),
+    );
     let ld_content = ld_content.replace("%SMP%", &format!("{}", axconfig::SMP));
 
     // target/<target_triple>/<mode>/build/axhal-xxxx/out
