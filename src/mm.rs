@@ -14,6 +14,33 @@ use kernel_elf_parser::{AuxvEntry, ELFParser, app_stack_region};
 use memory_addr::{MemoryAddr, PAGE_SIZE_4K, VirtAddr};
 use xmas_elf::{ElfFile, program::SegmentData};
 
+fn resolve_interp_path(requested: &str, app_path: &str) -> AxResult<String> {
+    let requested = requested.trim_matches(char::from(0));
+    let current_dir = axfs::api::current_dir().unwrap_or_default();
+    let is_glibc = app_path.starts_with("/glibc/")
+        || app_path.starts_with("./glibc/")
+        || current_dir.starts_with("/glibc/");
+
+    match requested {
+        "/lib/ld-linux-riscv64-lp64.so.1"
+        | "/lib/ld-linux-riscv64-lp64d.so.1"
+        | "/lib64/ld-linux-loongarch-lp64d.so.1" => {
+            if is_glibc {
+                if cfg!(target_arch = "riscv64") {
+                    Ok("/glibc/lib/ld-linux-riscv64-lp64d.so.1".into())
+                } else if cfg!(target_arch = "loongarch64") {
+                    Ok("/glibc/lib/ld-linux-loongarch-lp64d.so.1".into())
+                } else {
+                    axfs::api::canonicalize(requested)
+                }
+            } else {
+                Ok("/musl/lib/libc.so".into())
+            }
+        }
+        _ => axfs::api::canonicalize(requested),
+    }
+}
+
 /// Map the elf file to the user address space.
 ///
 /// # Arguments
@@ -39,15 +66,8 @@ fn map_elf(
         };
 
         let interp_path = from_utf8(interp).map_err(|_| AxError::InvalidInput)?;
-        // remove trailing '\0'
-        let mut real_interp_path =
-            axfs::api::canonicalize(interp_path.trim_matches(char::from(0)))?;
-        if real_interp_path == "/lib/ld-linux-riscv64-lp64.so.1"
-            || real_interp_path == "/lib64/ld-linux-loongarch-lp64d.so.1"
-        {
-            // TODO: Use soft link
-            real_interp_path = String::from("./musl/lib/libc.so");
-        }
+        let app_path = args.front().map(String::as_str).unwrap_or_default();
+        let real_interp_path = resolve_interp_path(interp_path, app_path)?;
 
         let interp_data = axfs::api::read(real_interp_path.as_str())?;
         let interp_elf = ElfFile::new(&interp_data).map_err(|_| AxError::InvalidData)?;
