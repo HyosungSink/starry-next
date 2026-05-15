@@ -88,6 +88,37 @@ fn test_get_parent(devfs: &RamFileSystem) -> VfsResult {
     Ok(())
 }
 
+fn test_large_sparse_file(devfs: &RamFileSystem) -> VfsResult {
+    let root = devfs.root_dir();
+    root.create("large", VfsNodeType::File)?;
+    let node = root.lookup("large")?;
+
+    let data = vec![0x5a; 80 * 1024];
+    assert_eq!(node.write_at(96 * 1024, &data)?, data.len());
+    assert_eq!(node.get_attr()?.size(), (96 + 80) as u64 * 1024);
+
+    let mut hole = vec![0xaa; 4 * 1024];
+    assert_eq!(node.read_at(64 * 1024, &mut hole)?, hole.len());
+    assert!(hole.iter().all(|&b| b == 0));
+
+    let mut read_back = vec![0; data.len()];
+    assert_eq!(node.read_at(96 * 1024, &mut read_back)?, data.len());
+    assert_eq!(read_back, data);
+
+    node.truncate(97 * 1024)?;
+    let mut truncated = vec![0xaa; 8 * 1024];
+    assert_eq!(node.read_at(97 * 1024, &mut truncated)?, 0);
+    assert_eq!(node.read_at(96 * 1024, &mut truncated)?, 1024);
+    assert!(truncated[..1024].iter().all(|&b| b == 0x5a));
+
+    node.truncate(160 * 1024)?;
+    let mut regrown = vec![0xaa; 8 * 1024];
+    assert_eq!(node.read_at(120 * 1024, &mut regrown)?, regrown.len());
+    assert!(regrown.iter().all(|&b| b == 0));
+
+    Ok(())
+}
+
 #[test]
 fn test_ramfs() {
     // .
@@ -117,6 +148,7 @@ fn test_ramfs() {
 
     test_ramfs_ops(&ramfs).unwrap();
     test_get_parent(&ramfs).unwrap();
+    test_large_sparse_file(&ramfs).unwrap();
 
     let root = ramfs.root_dir();
     assert_eq!(root.remove("f1"), Ok(()));
