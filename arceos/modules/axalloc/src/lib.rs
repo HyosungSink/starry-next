@@ -20,6 +20,7 @@ use kspin::SpinNoIrq;
 
 const PAGE_SIZE: usize = 0x1000;
 const MIN_HEAP_SIZE: usize = 0x8000; // 32 K
+const MAX_HEAP_GROW_STEP: usize = 0x20_0000; // 2 M
 
 pub use page::GlobalPage;
 
@@ -27,12 +28,15 @@ cfg_if::cfg_if! {
     if #[cfg(feature = "slab")] {
         /// The default byte allocator.
         pub type DefaultByteAllocator = allocator::SlabByteAllocator;
-    } else if #[cfg(feature = "buddy")] {
-        /// The default byte allocator.
+    } else if #[cfg(all(target_arch = "loongarch64", feature = "buddy"))] {
+        /// LoongArch falls back to buddy because TLSF pool growth is unstable there.
         pub type DefaultByteAllocator = allocator::BuddyByteAllocator;
     } else if #[cfg(feature = "tlsf")] {
         /// The default byte allocator.
         pub type DefaultByteAllocator = allocator::TlsfByteAllocator;
+    } else if #[cfg(feature = "buddy")] {
+        /// The default byte allocator.
+        pub type DefaultByteAllocator = allocator::BuddyByteAllocator;
     }
 }
 
@@ -53,6 +57,24 @@ pub struct GlobalAllocator {
 }
 
 impl GlobalAllocator {
+    #[inline]
+    fn heap_expand_align(expand_size: usize) -> usize {
+        #[cfg(all(target_arch = "loongarch64", feature = "buddy", not(feature = "slab")))]
+        {
+            // Buddy needs newly added heap regions to be aligned to the block
+            // order we want to serve, otherwise large requests can never be
+            // satisfied and we keep growing forever with fragmented 4K-aligned
+            // chunks.
+            return expand_size.next_power_of_two().max(PAGE_SIZE);
+        }
+
+        #[cfg(not(all(target_arch = "loongarch64", feature = "buddy", not(feature = "slab"))))]
+        {
+            let _ = expand_size;
+            PAGE_SIZE
+        }
+    }
+
     /// Creates an empty [`GlobalAllocator`].
     pub const fn new() -> Self {
         Self {
@@ -66,10 +88,12 @@ impl GlobalAllocator {
         cfg_if::cfg_if! {
             if #[cfg(feature = "slab")] {
                 "slab"
-            } else if #[cfg(feature = "buddy")] {
+            } else if #[cfg(all(target_arch = "loongarch64", feature = "buddy"))] {
                 "buddy"
             } else if #[cfg(feature = "tlsf")] {
                 "TLSF"
+            } else if #[cfg(feature = "buddy")] {
+                "buddy"
             }
         }
     }
@@ -110,15 +134,72 @@ impl GlobalAllocator {
                 return Ok(ptr);
             } else {
                 let old_size = balloc.total_bytes();
-                let expand_size = old_size
-                    .max(layout.size())
-                    .next_power_of_two()
-                    .max(PAGE_SIZE);
-                let heap_ptr = self.alloc_pages(expand_size / PAGE_SIZE, PAGE_SIZE)?;
+                let request_size = layout.size().next_power_of_two().max(PAGE_SIZE);
+                let grow_step = old_size.clamp(PAGE_SIZE, MAX_HEAP_GROW_STEP);
+                let mut expand_size = request_size.max(grow_step);
+                let request_pages = request_size.div_ceil(PAGE_SIZE);
+                let mut heap_ptr = None;
+                let mut last_err = None;
+
+                loop {
+                    let expand_pages = expand_size.div_ceil(PAGE_SIZE);
+                    let align_pow2 = Self::heap_expand_align(expand_pages * PAGE_SIZE);
+                    match self.alloc_pages(expand_pages, align_pow2) {
+                        Ok(ptr) => {
+                            heap_ptr = Some((ptr, expand_pages * PAGE_SIZE));
+                            if expand_size != request_size.max(grow_step) {
+                                debug!(
+                                    "byte allocator fragmented grow fallback: request={} initial_expand={} final_expand={}",
+                                    layout.size(),
+                                    request_size.max(grow_step),
+                                    expand_pages * PAGE_SIZE
+                                );
+                            }
+                            break;
+                        }
+                        Err(err) => {
+                            last_err = Some(err);
+                            if expand_pages <= request_pages {
+                                break;
+                            }
+                            let next_pages = (expand_pages / 2).max(request_pages);
+                            if next_pages == expand_pages {
+                                break;
+                            }
+                            expand_size = next_pages * PAGE_SIZE;
+                        }
+                    }
+                }
+
+                let (heap_ptr, expand_size) = match heap_ptr {
+                    Some(value) => value,
+                    None => {
+                        warn!(
+                            "byte allocator expand failed: request={} expand={} used_bytes={} total_bytes={} available_bytes={} available_pages={}",
+                            layout.size(),
+                            request_size.max(grow_step),
+                            balloc.used_bytes(),
+                            old_size,
+                            balloc.available_bytes(),
+                            self.available_pages()
+                        );
+                        return Err(last_err.unwrap());
+                    }
+                };
                 debug!(
                     "expand heap memory: [{:#x}, {:#x})",
                     heap_ptr,
                     heap_ptr + expand_size
+                );
+                #[cfg(target_arch = "loongarch64")]
+                warn!(
+                    "loongarch byte allocator expand: ptr={:#x} size={:#x} request={} used_bytes={} total_bytes={} available_pages={}",
+                    heap_ptr,
+                    expand_size,
+                    layout.size(),
+                    balloc.used_bytes(),
+                    old_size,
+                    self.available_pages()
                 );
                 balloc.add_memory(heap_ptr, expand_size)?;
             }
