@@ -93,6 +93,19 @@ impl<T> LazyInit<T> {
         }
     }
 
+    /// Replaces the value regardless of whether it has already been initialized.
+    pub fn replace(&self, data: T) -> &T {
+        if self.is_inited() {
+            unsafe {
+                let ptr = (*self.data.get()).as_mut_ptr();
+                core::ptr::replace(ptr, data);
+                self.force_get()
+            }
+        } else {
+            self.init_once(data)
+        }
+    }
+
     /// Gets the reference to the value without checking if it is initialized.
     ///
     /// # Safety
