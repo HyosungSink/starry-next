@@ -5,6 +5,31 @@ use core::time::Duration;
 use crate::ctypes;
 use crate::ctypes::{CLOCK_MONOTONIC, CLOCK_REALTIME};
 
+const CLOCK_PROCESS_CPUTIME_ID: u32 = 2;
+const CLOCK_THREAD_CPUTIME_ID: u32 = 3;
+const CLOCK_MONOTONIC_RAW: u32 = 4;
+const CLOCK_REALTIME_COARSE: u32 = 5;
+const CLOCK_MONOTONIC_COARSE: u32 = 6;
+const CLOCK_BOOTTIME: u32 = 7;
+const CLOCK_REALTIME_ALARM: u32 = 8;
+const CLOCK_BOOTTIME_ALARM: u32 = 9;
+
+fn validate_clock(clk: ctypes::clockid_t) -> Result<(), LinuxError> {
+    match clk as u32 {
+        CLOCK_REALTIME
+        | CLOCK_REALTIME_COARSE
+        | CLOCK_MONOTONIC
+        | CLOCK_PROCESS_CPUTIME_ID
+        | CLOCK_THREAD_CPUTIME_ID
+        | CLOCK_MONOTONIC_RAW
+        | CLOCK_MONOTONIC_COARSE
+        | CLOCK_BOOTTIME
+        | CLOCK_REALTIME_ALARM
+        | CLOCK_BOOTTIME_ALARM => Ok(()),
+        _ => Err(LinuxError::EINVAL),
+    }
+}
+
 impl From<ctypes::timespec> for Duration {
     fn from(ts: ctypes::timespec) -> Self {
         Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
@@ -42,8 +67,16 @@ pub unsafe fn sys_clock_gettime(clk: ctypes::clockid_t, ts: *mut ctypes::timespe
             return Err(LinuxError::EFAULT);
         }
         let now = match clk as u32 {
-            CLOCK_REALTIME => axhal::time::wall_time().into(),
-            CLOCK_MONOTONIC => axhal::time::monotonic_time().into(),
+            CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM => {
+                axhal::time::wall_time().into()
+            }
+            CLOCK_MONOTONIC
+            | CLOCK_PROCESS_CPUTIME_ID
+            | CLOCK_THREAD_CPUTIME_ID
+            | CLOCK_MONOTONIC_RAW
+            | CLOCK_MONOTONIC_COARSE
+            | CLOCK_BOOTTIME
+            | CLOCK_BOOTTIME_ALARM => axhal::time::monotonic_time().into(),
             _ => {
                 warn!("Called sys_clock_gettime for unsupported clock {}", clk);
                 return Err(LinuxError::EINVAL);
@@ -51,6 +84,24 @@ pub unsafe fn sys_clock_gettime(clk: ctypes::clockid_t, ts: *mut ctypes::timespe
         };
         unsafe { *ts = now };
         debug!("sys_clock_gettime: {}.{:09}s", now.tv_sec, now.tv_nsec);
+        Ok(0)
+    })
+}
+
+/// Get clock resolution.
+pub unsafe fn sys_clock_getres(clk: ctypes::clockid_t, ts: *mut ctypes::timespec) -> c_int {
+    syscall_body!(sys_clock_getres, {
+        validate_clock(clk)?;
+        if ts.is_null() {
+            return Ok(0);
+        }
+        let resolution_ns = axhal::time::ticks_to_nanos(1).max(1);
+        unsafe {
+            *ts = ctypes::timespec {
+                tv_sec: (resolution_ns / 1_000_000_000) as c_long,
+                tv_nsec: (resolution_ns % 1_000_000_000) as c_long,
+            };
+        }
         Ok(0)
     })
 }
