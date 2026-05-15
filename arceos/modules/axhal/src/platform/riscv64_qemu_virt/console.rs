@@ -1,12 +1,15 @@
+use kspin::SpinNoIrq;
 use memory_addr::VirtAddr;
 
 use crate::mem::virt_to_phys;
 
 /// The maximum number of bytes that can be read at once.
 const MAX_RW_SIZE: usize = 256;
+static CONSOLE_WRITE_LOCK: SpinNoIrq<()> = SpinNoIrq::new(());
 
 /// Writes a byte to the console.
 pub fn putchar(c: u8) {
+    let _guard = CONSOLE_WRITE_LOCK.lock();
     sbi_rt::console_write_byte(c);
 }
 
@@ -25,6 +28,7 @@ fn try_write_bytes(bytes: &[u8]) -> usize {
 
 /// Writes bytes to the console from input u8 slice.
 pub fn write_bytes(bytes: &[u8]) {
+    let _guard = CONSOLE_WRITE_LOCK.lock();
     // If the address is from userspace, we need to copy the bytes to kernel space.
     #[cfg(feature = "uspace")]
     if bytes.as_ptr() as usize & (1 << 63) == 0 {

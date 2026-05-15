@@ -32,7 +32,8 @@ pub fn epochoffset_nanos() -> u64 {
 /// A timer interrupt will be triggered at the specified monotonic time deadline (in nanoseconds).
 #[cfg(feature = "irq")]
 pub fn set_oneshot_timer(deadline_ns: u64) {
-    sbi_rt::set_timer(nanos_to_ticks(deadline_ns));
+    let min_deadline_ns = ticks_to_nanos(current_ticks()).saturating_add(NANOS_PER_TICK);
+    sbi_rt::set_timer(nanos_to_ticks(deadline_ns.max(min_deadline_ns)));
 }
 
 pub(super) fn init_early() {
