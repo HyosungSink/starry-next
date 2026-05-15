@@ -315,6 +315,7 @@ dependencies = [
 name = "axfs_ramfs"
 version = "0.1.1"
 dependencies = [
+ "axalloc",
  "axfs_vfs",
  "log",
  "spin",

@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec;
+use axalloc::global_allocator;
 use axfs_vfs::{
     impl_vfs_non_dir_default, VfsNodeAttr, VfsNodeOps, VfsNodePerm, VfsNodeType, VfsResult,
 };
@@ -12,6 +13,7 @@ use crate::FsQuota;
 
 const CHUNK_SIZE: usize = 4 * 1024;
 const MAX_RESERVED_FALLOCATE_CHUNKS: usize = 4096;
+const MIN_ALLOCATOR_RESERVE_PAGES: usize = 64;
 static LARGE_RAMFS_WRITE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 struct FileContent {
@@ -47,12 +49,19 @@ impl FileContent {
         len.div_ceil(CHUNK_SIZE)
     }
 
-    fn ensure_chunk_allocated(&mut self, chunk_idx: usize) -> &mut [u8] {
-        self.reserved_chunks.remove(&chunk_idx);
-        self.chunks
-            .entry(chunk_idx)
-            .or_insert_with(|| vec![0; CHUNK_SIZE].into_boxed_slice())
-            .as_mut()
+    fn ensure_chunk_allocated(&mut self, chunk_idx: usize) -> VfsResult<&mut [u8]> {
+        if !self.chunks.contains_key(&chunk_idx) {
+            Self::ensure_allocator_headroom(1)?;
+        }
+        let was_reserved = self.reserved_chunks.remove(&chunk_idx);
+        let entry = self.chunks.entry(chunk_idx).or_insert_with(|| {
+            vec![0; CHUNK_SIZE].into_boxed_slice()
+        });
+        if was_reserved && entry.len() != CHUNK_SIZE {
+            self.reserved_chunks.insert(chunk_idx);
+            return Err(axfs_vfs::VfsError::StorageFull);
+        }
+        Ok(entry.as_mut())
     }
 
     fn zero_range(&mut self, start: usize, end: usize) {
@@ -77,6 +86,17 @@ impl FileContent {
                 !self.chunks.contains_key(chunk_idx) && !self.reserved_chunks.contains(chunk_idx)
             })
             .count()
+    }
+
+    fn ensure_allocator_headroom(new_chunks: usize) -> VfsResult {
+        if new_chunks == 0 {
+            return Ok(());
+        }
+        let required_pages = new_chunks.saturating_add(MIN_ALLOCATOR_RESERVE_PAGES);
+        if global_allocator().available_pages() < required_pages {
+            return Err(axfs_vfs::VfsError::StorageFull);
+        }
+        Ok(())
     }
 }
 
@@ -120,6 +140,7 @@ impl FileNode {
         let end_chunk = end.div_ceil(CHUNK_SIZE);
         let new_chunks = content.missing_reserved_chunks(start_chunk, end_chunk);
         if new_chunks <= MAX_RESERVED_FALLOCATE_CHUNKS {
+            FileContent::ensure_allocator_headroom(new_chunks)?;
             self.quota.reserve(new_chunks * CHUNK_SIZE)?;
             for chunk_idx in start_chunk..end_chunk {
                 if !content.chunks.contains_key(&chunk_idx) {
@@ -241,6 +262,7 @@ impl VfsNodeOps for FileNode {
         let start_chunk = offset / CHUNK_SIZE;
         let end_chunk = end.div_ceil(CHUNK_SIZE);
         let new_chunks = content.missing_reserved_chunks(start_chunk, end_chunk);
+        FileContent::ensure_allocator_headroom(new_chunks)?;
         self.quota.reserve(new_chunks * CHUNK_SIZE)?;
         let mut write_pos = offset;
         let mut src_pos = 0;
@@ -248,7 +270,7 @@ impl VfsNodeOps for FileNode {
             let chunk_idx = write_pos / CHUNK_SIZE;
             let within_chunk = write_pos % CHUNK_SIZE;
             let chunk_end = ((chunk_idx + 1) * CHUNK_SIZE).min(end);
-            let dst = &mut content.ensure_chunk_allocated(chunk_idx)
+            let dst = &mut content.ensure_chunk_allocated(chunk_idx)?
                 [within_chunk..within_chunk + (chunk_end - write_pos)];
             dst.copy_from_slice(&buf[src_pos..src_pos + dst.len()]);
             src_pos += dst.len();

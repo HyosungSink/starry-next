@@ -43,6 +43,9 @@ path = "src/lib.rs"
 [dependencies.axfs_vfs]
 version = "0.1"
 
+[dependencies.axalloc]
+path = "../../arceos/modules/axalloc"
+
 [dependencies.log]
 version = "0.4"
 
