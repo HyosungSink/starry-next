@@ -3,6 +3,10 @@ use alloc::slice::from_raw_parts_mut;
 use alloc::string::String;
 use core::cmp::min;
 use core::ffi::{c_char, c_int, c_size_t, c_void};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static LARGE_LWEXT4_MALLOC_LOGGED: AtomicBool = AtomicBool::new(false);
+static LARGE_LWEXT4_REALLOC_LOGGED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(feature = "print")]
 #[linkage = "weak"]
@@ -57,6 +61,12 @@ pub extern "C" fn realloc(memblock: *mut c_void, size: c_size_t) -> *mut c_void 
 
     let ptr = memblock.cast::<MemoryControlBlock>();
     let old_size = unsafe { ptr.sub(1).read().size };
+    if size >= (1 << 20) && !LARGE_LWEXT4_REALLOC_LOGGED.swap(true, Ordering::Relaxed) {
+        warn!(
+            "lwext4 realloc large old_size={} new_size={}",
+            old_size, size
+        );
+    }
     info!("realloc from {} to {}", old_size, size);
 
     let mem = malloc(size);
@@ -85,6 +95,9 @@ const CTRL_BLK_SIZE: usize = core::mem::size_of::<MemoryControlBlock>();
 #[linkage = "weak"]
 #[no_mangle]
 pub extern "C" fn malloc(size: c_size_t) -> *mut c_void {
+    if size >= (1 << 20) && !LARGE_LWEXT4_MALLOC_LOGGED.swap(true, Ordering::Relaxed) {
+        warn!("lwext4 malloc large size={}", size);
+    }
     // Allocate `(actual length) + 8`. The lowest 8 Bytes are stored in the actual allocated space size.
     let layout = Layout::from_size_align(size + CTRL_BLK_SIZE, 8).unwrap();
     unsafe {
