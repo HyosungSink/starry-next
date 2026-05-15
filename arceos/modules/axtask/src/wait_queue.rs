@@ -188,6 +188,11 @@ impl WaitQueue {
         }
     }
 
+    /// Returns true if at least one task is sleeping in this wait queue.
+    pub fn has_waiters(&self) -> bool {
+        !self.queue.lock().is_empty()
+    }
+
     /// Wake up the given task in the wait queue.
     ///
     /// If `resched` is true, the current task will be preempted when the

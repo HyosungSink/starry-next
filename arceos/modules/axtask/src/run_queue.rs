@@ -1,6 +1,9 @@
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use axhal::arch::TrapFrame;
+use axhal::time::monotonic_time_nanos;
 use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "smp")]
 use alloc::sync::Weak;
@@ -15,6 +18,33 @@ use axhal::cpu::this_cpu_id;
 use crate::task::{CurrentTask, TaskState};
 use crate::wait_queue::WaitQueueGuard;
 use crate::{AxCpuMask, AxTaskRef, Scheduler, TaskInner, WaitQueue};
+
+static NICE05_UNBLOCK_DIAG_COUNT: AtomicU64 = AtomicU64::new(0);
+static NICE05_SWITCH_DIAG_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn take_nice05_unblock_diag_slot(task: &AxTaskRef) -> Option<u64> {
+    if !task.name().contains("nice05") {
+        return None;
+    }
+    let slot = NICE05_UNBLOCK_DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+    (slot < 64).then_some(slot + 1)
+}
+
+fn take_nice05_switch_diag_slot(prev_task: &CurrentTask, next_task: &AxTaskRef) -> Option<u64> {
+    if !prev_task.name().contains("nice05") && !next_task.name().contains("nice05") {
+        return None;
+    }
+    let slot = NICE05_SWITCH_DIAG_COUNT.fetch_add(1, Ordering::Relaxed);
+    (slot < 256).then_some(slot + 1)
+}
+
+fn task_user_context(task: &AxTaskRef) -> Option<(usize, usize)> {
+    let kstack_top = task.get_kernel_stack_top()?;
+    let trap_frame_size = core::mem::size_of::<TrapFrame>();
+    let trap_frame_ptr = (kstack_top - trap_frame_size) as *const TrapFrame;
+    let tf = unsafe { &*trap_frame_ptr };
+    Some((tf.get_ip(), tf.get_sp()))
+}
 
 macro_rules! percpu_static {
     ($(
@@ -201,6 +231,24 @@ pub(crate) struct AxRunQueueRef<'a, G: BaseGuard> {
     _phantom: core::marker::PhantomData<G>,
 }
 
+fn collect_exited_tasks(max_scan: usize) -> usize {
+    let n = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.len().min(max_scan));
+    let mut dropped = 0;
+    for _ in 0..n {
+        // Do not hold the per-cpu queue borrow while running task destructors.
+        let task = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.pop_front());
+        if let Some(task) = task {
+            drop(task);
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
+pub(crate) fn reclaim_exited_tasks(max_scan: usize) -> usize {
+    collect_exited_tasks(max_scan)
+}
+
 impl<G: BaseGuard> Drop for AxRunQueueRef<'_, G> {
     fn drop(&mut self) {
         G::release(self.state);
@@ -246,6 +294,20 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
     /// which means the task is already unblocked by other cores.
     pub fn unblock_task(&mut self, task: AxTaskRef, resched: bool) {
         let task_id_name = task.id_name();
+        let diag_slot = take_nice05_unblock_diag_slot(&task);
+        let diag_task = diag_slot.map(|_| task.clone());
+        if let Some(slot) = diag_slot {
+            warn!(
+                "[nice05-unblock:{}] enter tid={} name={} state={:?} resched={} rq_cpu={} this_cpu={}",
+                slot,
+                task.id().as_u64(),
+                task.name(),
+                task.state(),
+                resched,
+                self.inner.cpu_id,
+                this_cpu_id(),
+            );
+        }
         // Try to change the state of the task from `Blocked` to `Ready`,
         // if successful, the task will be put into this run queue,
         // otherwise, the task is already unblocked by other cores.
@@ -264,7 +326,28 @@ impl<G: BaseGuard> AxRunQueueRef<'_, G> {
                 #[cfg(feature = "preempt")]
                 crate::current().set_preempt_pending(true);
             }
+            if let (Some(slot), Some(diag_task)) = (diag_slot, diag_task.as_ref()) {
+                warn!(
+                    "[nice05-unblock:{}] success tid={} name={} new_state={:?}",
+                    slot,
+                    diag_task.id().as_u64(),
+                    diag_task.name(),
+                    diag_task.state(),
+                );
+            }
+        } else if let (Some(slot), Some(diag_task)) = (diag_slot, diag_task.as_ref()) {
+            warn!(
+                "[nice05-unblock:{}] skip tid={} name={} state_now={:?}",
+                slot,
+                diag_task.id().as_u64(),
+                diag_task.name(),
+                diag_task.state(),
+            );
         }
+    }
+
+    pub fn set_task_priority(&mut self, task: &AxTaskRef, prio: isize) -> bool {
+        self.inner.scheduler.lock().set_priority(task, prio)
     }
 }
 
@@ -286,11 +369,21 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
         let curr = &self.current_task;
         trace!("task yield: {}", curr.id_name());
         assert!(curr.is_running());
-
-        self.inner
-            .put_task_with_state(curr.clone(), TaskState::Running, false);
-
-        self.inner.resched();
+        let next = {
+            let mut scheduler = self.inner.scheduler.lock();
+            assert!(curr.transition_state(TaskState::Running, TaskState::Ready));
+            scheduler.put_prev_task(curr.clone(), false);
+            scheduler.pick_next_task().unwrap_or_else(|| unsafe {
+                IDLE_TASK.current_ref_raw().get_unchecked().clone()
+            })
+        };
+        assert!(
+            next.is_ready(),
+            "next {} is not ready: {:?}",
+            next.id_name(),
+            next.state()
+        );
+        self.inner.switch_to(crate::current(), next);
     }
 
     /// Migrate the current task to a new run queue matching its CPU affinity and reschedule.
@@ -369,6 +462,10 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
 
             // Notify the joiner task.
             curr.notify_exit(exit_code);
+
+            // Reclaim older exited tasks eagerly so fork/exit-heavy workloads
+            // do not pile up kernel stacks before the GC task gets scheduled.
+            let _ = collect_exited_tasks(32);
 
             // Safety: it is called from `current_run_queue::<NoPreemptIrqSave>().exit_current(exit_code)`,
             // which disabled IRQs and preemption.
@@ -451,6 +548,10 @@ impl AxRunQueue {
         gc_task.set_cpumask(AxCpuMask::one_shot(cpu_id));
 
         let mut scheduler = Scheduler::new();
+        #[cfg(feature = "sched_rr")]
+        let _ = scheduler.set_priority(&gc_task, isize::MIN / 4);
+        #[cfg(feature = "sched_cfs")]
+        let _ = scheduler.set_priority(&gc_task, 19);
         scheduler.add_task(gc_task);
         Self {
             cpu_id,
@@ -533,12 +634,36 @@ impl AxRunQueue {
             prev_task.id_name(),
             next_task.id_name()
         );
+        if let Some(slot) = take_nice05_switch_diag_slot(&prev_task, &next_task) {
+            let prev_user = task_user_context(prev_task.as_task_ref());
+            let next_user = task_user_context(&next_task);
+            warn!(
+                "[nice05-switch:{}] prev_tid={} prev_name={} prev_state={:?} prev_ip={:#x} prev_sp={:#x} next_tid={} next_name={} next_state={:?} next_ip={:#x} next_sp={:#x}",
+                slot,
+                prev_task.id().as_u64(),
+                prev_task.name(),
+                prev_task.state(),
+                prev_user.map(|v| v.0).unwrap_or(0),
+                prev_user.map(|v| v.1).unwrap_or(0),
+                next_task.id().as_u64(),
+                next_task.name(),
+                next_task.state(),
+                next_user.map(|v| v.0).unwrap_or(0),
+                next_user.map(|v| v.1).unwrap_or(0),
+            );
+        }
         #[cfg(feature = "preempt")]
         next_task.set_preempt_pending(false);
         next_task.set_state(TaskState::Running);
         if prev_task.ptr_eq(&next_task) {
             return;
         }
+        let now = monotonic_time_nanos() as usize;
+        crate::notify_task_switch(
+            unsafe { prev_task.task_ext_ptr() },
+            unsafe { next_task.task_ext_ptr() },
+            now,
+        );
 
         // Claim the task as running, we do this before switching to it
         // such that any running task will have this set.
@@ -575,20 +700,11 @@ impl AxRunQueue {
 fn gc_entry() {
     loop {
         // Drop all exited tasks and recycle resources.
-        let n = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.len());
-        for _ in 0..n {
-            // Do not do the slow drops in the critical section.
-            let task = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.pop_front());
-            if let Some(task) = task {
-                if Arc::strong_count(&task) == 1 {
-                    // If I'm the last holder of the task, drop it immediately.
-                    drop(task);
-                } else {
-                    // Otherwise (e.g, `switch_to` is not compeleted, held by the
-                    // joiner, etc), push it back and wait for them to drop first.
-                    EXITED_TASKS.with_current(|exited_tasks| exited_tasks.push_back(task));
-                }
-            }
+        let pending = EXITED_TASKS.with_current(|exited_tasks| exited_tasks.len());
+        let _ = collect_exited_tasks(pending);
+        if EXITED_TASKS.with_current(|exited_tasks| !exited_tasks.is_empty()) {
+            crate::yield_now();
+            continue;
         }
         // Note: we cannot block current task with preemption disabled,
         // use `current_ref_raw` to get the `WAIT_FOR_EXIT`'s reference here to avoid the use of `NoPreemptGuard`.
