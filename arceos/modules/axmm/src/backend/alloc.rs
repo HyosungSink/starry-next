@@ -27,6 +27,7 @@ pub(crate) struct SharedPageRegistry {
 pub(crate) struct CowPageRegistry {
     pages: SpinNoIrq<Arc<BTreeMap<usize, PhysAddr>>>,
     dirty_pages: SpinNoIrq<BTreeSet<usize>>,
+    owned_pages: SpinNoIrq<BTreeSet<usize>>,
 }
 
 impl SharedPageRegistry {
@@ -53,9 +54,11 @@ impl SharedPageRegistry {
 
 impl CowPageRegistry {
     pub(crate) fn from_snapshot(frames: Vec<(usize, PhysAddr)>) -> Self {
+        let owned_pages = frames.iter().map(|(page, _)| *page).collect();
         Self {
             pages: SpinNoIrq::new(Arc::new(frames.into_iter().collect())),
             dirty_pages: SpinNoIrq::new(BTreeSet::new()),
+            owned_pages: SpinNoIrq::new(owned_pages),
         }
     }
 
@@ -63,11 +66,21 @@ impl CowPageRegistry {
         Self {
             pages: SpinNoIrq::new(pages),
             dirty_pages: SpinNoIrq::new(BTreeSet::new()),
+            owned_pages: SpinNoIrq::new(BTreeSet::new()),
+        }
+    }
+
+    pub(crate) fn from_shared_pages_owned(pages: Arc<BTreeMap<usize, PhysAddr>>) -> Self {
+        let owned_pages = pages.keys().copied().collect();
+        Self {
+            pages: SpinNoIrq::new(pages),
+            dirty_pages: SpinNoIrq::new(BTreeSet::new()),
+            owned_pages: SpinNoIrq::new(owned_pages),
         }
     }
 
     pub(crate) fn share_pages(&self) -> Self {
-        Self::from_shared_pages(Arc::clone(&self.pages.lock()))
+        Self::from_shared_pages_owned(Arc::clone(&self.pages.lock()))
     }
 
     pub(crate) fn snapshot(&self) -> Vec<(usize, PhysAddr)> {
@@ -108,6 +121,27 @@ impl CowPageRegistry {
         self.dirty_pages.lock().insert(page_index);
     }
 
+    pub(crate) fn take_owned_page(&self, page_index: usize) -> bool {
+        self.owned_pages.lock().remove(&page_index)
+    }
+
+    pub(crate) fn take_owned_frames(&self) -> Vec<PhysAddr> {
+        let owned_pages: Vec<usize> = {
+            let mut owned = self.owned_pages.lock();
+            let pages = owned.iter().copied().collect();
+            owned.clear();
+            pages
+        };
+        if owned_pages.is_empty() {
+            return Vec::new();
+        }
+        let pages = self.pages.lock();
+        owned_pages
+            .into_iter()
+            .filter_map(|page| pages.get(&page).copied())
+            .collect()
+    }
+
     pub(crate) fn take_dirty_pages(&self) -> Vec<usize> {
         let mut dirty = self.dirty_pages.lock();
         let pages: Vec<usize> = dirty.iter().copied().collect();
@@ -119,9 +153,11 @@ impl CowPageRegistry {
         frames: Vec<(usize, PhysAddr)>,
         dirty_pages: Vec<usize>,
     ) -> Self {
+        let owned_pages = frames.iter().map(|(page, _)| *page).collect();
         Self {
             pages: SpinNoIrq::new(Arc::new(frames.into_iter().collect())),
             dirty_pages: SpinNoIrq::new(dirty_pages.into_iter().collect()),
+            owned_pages: SpinNoIrq::new(owned_pages),
         }
     }
 
@@ -176,6 +212,24 @@ impl SharedFrames {
     pub(crate) fn slice_range(&self, page_offset: usize, page_count: usize) -> Vec<PhysAddr> {
         let end = page_offset.saturating_add(page_count).min(self.frames.len());
         self.frames[page_offset.min(end)..end].to_vec()
+    }
+}
+
+impl Drop for CowPageRegistry {
+    fn drop(&mut self) {
+        let owned_pages: Vec<usize> = {
+            let owned = self.owned_pages.lock();
+            owned.iter().copied().collect()
+        };
+        if owned_pages.is_empty() {
+            return;
+        }
+        let pages = self.pages.lock();
+        let frames: Vec<PhysAddr> = owned_pages
+            .into_iter()
+            .filter_map(|page| pages.get(&page).copied())
+            .collect();
+        dec_frame_refs(&frames);
     }
 }
 
@@ -602,6 +656,7 @@ impl Backend {
                 unmapped_frames.push(frame);
             }
         }
+        unmapped_frames.extend(pages.take_owned_frames());
         dec_frame_refs(&unmapped_frames);
         true
     }
@@ -700,6 +755,7 @@ impl Backend {
                     );
                 }
                 if install_page_mapping(pt, page, new_frame, orig_flags) {
+                    let _ = pages.take_owned_page(page_index);
                     pages.update_page(page_index, new_frame);
                     pages.mark_dirty(page_index);
                     dec_frame_ref(old_frame.align_down_4k());
@@ -709,7 +765,10 @@ impl Backend {
                     false
                 }
             } else {
-                inc_frame_ref(old_frame);
+                let transferred_owned_ref = pages.take_owned_page(page_index);
+                if !transferred_owned_ref {
+                    inc_frame_ref(old_frame);
+                }
                 if install_page_mapping(pt, page, old_frame, orig_flags & !MappingFlags::WRITE) {
                     true
                 } else {

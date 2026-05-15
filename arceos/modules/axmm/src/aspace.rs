@@ -901,7 +901,7 @@ impl AddrSpace {
                         let parent_pages =
                             Arc::new(CowPageRegistry::from_shared_pages(Arc::clone(&shared_pages)));
                         let child_pages =
-                            Arc::new(CowPageRegistry::from_shared_pages(shared_pages));
+                            Arc::new(CowPageRegistry::from_shared_pages_owned(shared_pages));
                         area.set_backend(Backend::new_cow(parent_pages));
                         Backend::new_cow(child_pages)
                     }
