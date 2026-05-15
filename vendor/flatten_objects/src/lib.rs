@@ -48,6 +48,17 @@ pub struct FlattenObjects<T, const CAP: usize> {
     count: usize,
 }
 
+impl<T, const CAP: usize> Drop for FlattenObjects<T, CAP> {
+    fn drop(&mut self) {
+        for id in (&self.id_bitmap).into_iter() {
+            if id >= CAP {
+                continue;
+            }
+            unsafe { self.objects[id].assume_init_drop() };
+        }
+    }
+}
+
 impl<T, const CAP: usize> FlattenObjects<T, CAP> {
     /// Creates a new empty `FlattenObjects`.
     ///
@@ -195,6 +206,18 @@ impl<T, const CAP: usize> FlattenObjects<T, CAP> {
         } else {
             None
         }
+    }
+
+    /// Iterates over all assigned objects in ascending ID order.
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &T)> + '_ {
+        (&self.id_bitmap).into_iter().filter_map(|id| {
+            if id < CAP {
+                self.get(id).map(|value| (id, value))
+            } else {
+                None
+            }
+        })
     }
 
     /// Add an object and assigns it the smallest available ID.
