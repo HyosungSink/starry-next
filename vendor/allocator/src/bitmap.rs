@@ -133,11 +133,37 @@ impl<const PAGE_SIZE: usize> PageAllocator for BitmapPageAllocator<PAGE_SIZE> {
             crate::is_aligned(pos, Self::PAGE_SIZE),
             "pos must be aligned to PAGE_SIZE"
         );
+        if pos < self.base {
+            log::warn!(
+                "BitmapPageAllocator::dealloc_pages invalid pos={:#x} base={:#x} num_pages={} total_pages={} used_pages={}",
+                pos,
+                self.base,
+                num_pages,
+                self.total_pages,
+                self.used_pages
+            );
+            return;
+        }
+        let key = (pos - self.base) / PAGE_SIZE;
+        let cap = BitAllocUsed::CAP;
+        if key >= cap || key.saturating_add(num_pages) > cap {
+            log::warn!(
+                "BitmapPageAllocator::dealloc_pages out of range pos={:#x} base={:#x} key={} num_pages={} cap={} total_pages={} used_pages={}",
+                pos,
+                self.base,
+                key,
+                num_pages,
+                cap,
+                self.total_pages,
+                self.used_pages
+            );
+            return;
+        }
         if match num_pages.cmp(&1) {
-            core::cmp::Ordering::Equal => self.inner.dealloc((pos - self.base) / PAGE_SIZE),
+            core::cmp::Ordering::Equal => self.inner.dealloc(key),
             core::cmp::Ordering::Greater => self
                 .inner
-                .dealloc_contiguous((pos - self.base) / PAGE_SIZE, num_pages),
+                .dealloc_contiguous(key, num_pages),
             _ => false,
         } {
             self.used_pages -= num_pages;

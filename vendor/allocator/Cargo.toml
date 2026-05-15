@@ -62,6 +62,7 @@ harness = false
 
 [dependencies]
 cfg-if = "1.0"
+log = "0.4"
 
 [dependencies.bitmap-allocator]
 version = "0.2"
