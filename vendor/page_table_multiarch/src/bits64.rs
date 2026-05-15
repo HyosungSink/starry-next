@@ -346,10 +346,111 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
         assert!(end_idx <= ENTRY_COUNT);
         dst_table[start_idx..end_idx].copy_from_slice(&src_table[start_idx..end_idx]);
     }
+
+    /// Clears root-level entries within the given virtual memory range.
+    ///
+    /// This only detaches the top-level entries and does not deallocate any
+    /// lower-level page tables referenced by them.
+    pub fn clear_root_entries(&mut self, start: M::VirtAddr, size: usize) {
+        if size == 0 {
+            return;
+        }
+        let table = self.table_of_mut(self.root_paddr);
+        let index_fn = if M::LEVELS == 3 {
+            p3_index
+        } else if M::LEVELS == 4 {
+            p4_index
+        } else {
+            unreachable!()
+        };
+        let start_idx = index_fn(start.into());
+        let end_idx = index_fn(start.into() + size - 1) + 1;
+        assert!(start_idx < ENTRY_COUNT);
+        assert!(end_idx <= ENTRY_COUNT);
+        for entry in &mut table[start_idx..end_idx] {
+            entry.clear();
+        }
+    }
+
+    /// Reclaims empty intermediate page tables within the given virtual range.
+    pub fn reclaim_empty(&mut self, start: M::VirtAddr, size: usize) {
+        if size == 0 {
+            return;
+        }
+        let start_usize: usize = start.into();
+        let end_usize = start_usize.saturating_add(size);
+        self.reclaim_empty_recursive(self.root_paddr, 0, 0, start_usize, end_usize);
+    }
 }
 
 // Private implements.
 impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H> {
+    fn free_page_tables_recursive(&mut self, table_paddr: PhysAddr, level: usize) {
+        if level >= M::LEVELS - 1 {
+            return;
+        }
+        let table_ptr = self.table_of(table_paddr).as_ptr();
+        for i in 0..ENTRY_COUNT {
+            let entry = unsafe { *table_ptr.add(i) };
+            #[cfg(not(target_arch = "loongarch64"))]
+            let present = entry.is_present();
+            #[cfg(target_arch = "loongarch64")]
+            let present = entry.paddr().as_usize() != 0;
+            if !present || entry.is_huge() {
+                continue;
+            }
+            let child_paddr = entry.paddr();
+            self.free_page_tables_recursive(child_paddr, level + 1);
+            H::dealloc_frame(child_paddr);
+        }
+    }
+
+    fn reclaim_empty_recursive(
+        &mut self,
+        table_paddr: PhysAddr,
+        level: usize,
+        table_vaddr: usize,
+        range_start: usize,
+        range_end: usize,
+    ) -> bool {
+        let shift = 12 + (M::LEVELS - 1 - level) * 9;
+        let span = 1usize << shift;
+        let table_ptr = self.table_of_mut(table_paddr).as_mut_ptr();
+        let mut empty = true;
+
+        for i in 0..ENTRY_COUNT {
+            let entry_start = table_vaddr + (i << shift);
+            let entry_end = entry_start.saturating_add(span);
+            let overlaps = entry_start < range_end && range_start < entry_end;
+
+            let entry = unsafe { *table_ptr.add(i) };
+            if !entry.is_present() {
+                continue;
+            }
+
+            if overlaps && level < M::LEVELS - 1 && !entry.is_huge() {
+                let child_paddr = entry.paddr();
+                if self.reclaim_empty_recursive(
+                    child_paddr,
+                    level + 1,
+                    entry_start,
+                    range_start,
+                    range_end,
+                ) {
+                    unsafe {
+                        (*table_ptr.add(i)).clear();
+                    }
+                    H::dealloc_frame(child_paddr);
+                    continue;
+                }
+            }
+
+            empty = false;
+        }
+
+        empty
+    }
+
     fn alloc_table() -> PagingResult<PhysAddr> {
         if let Some(paddr) = H::alloc_frame() {
             let ptr = H::phys_to_virt(paddr).as_mut_ptr();
@@ -552,16 +653,7 @@ impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> PageTable64<M, PTE, H
 
 impl<M: PagingMetaData, PTE: GenericPTE, H: PagingHandler> Drop for PageTable64<M, PTE, H> {
     fn drop(&mut self) {
-        // don't free the entries in last level, they are not array.
-        let _ = self.walk(
-            usize::MAX,
-            None,
-            Some(&|level, _index, _vaddr, entry: &PTE| {
-                if level < M::LEVELS - 1 && entry.is_present() && !entry.is_huge() {
-                    H::dealloc_frame(entry.paddr());
-                }
-            }),
-        );
+        self.free_page_tables_recursive(self.root_paddr, 0);
         H::dealloc_frame(self.root_paddr());
     }
 }
