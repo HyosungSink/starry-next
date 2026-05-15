@@ -19,6 +19,10 @@ pub mod misc {
     pub fn terminate() -> ! {
         unimplemented!()
     }
+
+    pub fn terminate_on_panic() -> ! {
+        terminate()
+    }
 }
 
 #[cfg(feature = "smp")]

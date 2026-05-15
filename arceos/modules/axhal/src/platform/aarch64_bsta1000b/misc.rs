@@ -1,4 +1,5 @@
 pub use crate::platform::aarch64_common::psci::system_off as terminate;
+pub use crate::platform::aarch64_common::psci::system_off as terminate_on_panic;
 
 use crate::mem::phys_to_virt;
 use crate::time::{Duration, busy_wait};

@@ -23,6 +23,10 @@ pub mod misc {
             crate::arch::halt();
         }
     }
+
+    pub fn terminate_on_panic() -> ! {
+        terminate()
+    }
 }
 
 unsafe extern "C" {
