@@ -1,7 +1,11 @@
 //! User-defined task extended data.
 
+use alloc::{collections::BTreeMap, vec::Vec};
 use core::alloc::Layout;
 use core::mem::{align_of, size_of};
+
+use kspin::SpinNoIrq;
+use lazyinit::LazyInit;
 
 #[unsafe(no_mangle)]
 #[linkage = "weak"]
@@ -11,10 +15,25 @@ static __AX_TASK_EXT_SIZE: usize = 0;
 #[linkage = "weak"]
 static __AX_TASK_EXT_ALIGN: usize = 0;
 
+#[unsafe(no_mangle)]
+#[linkage = "weak"]
+unsafe extern "C" fn __ax_task_ext_drop(_ptr: *mut u8) {}
+
 /// A wrapper of pointer to the task extended data.
 pub(crate) struct AxTaskExt {
     ptr: *mut u8,
 }
+
+fn task_ext_cache() -> &'static SpinNoIrq<BTreeMap<(usize, usize), Vec<usize>>> {
+    static CACHE: LazyInit<SpinNoIrq<BTreeMap<(usize, usize), Vec<usize>>>> = LazyInit::new();
+    if let Some(cache) = CACHE.get() {
+        cache
+    } else {
+        CACHE.init_once(SpinNoIrq::new(BTreeMap::new()))
+    }
+}
+
+const TASK_EXT_CACHE_LIMIT_PER_LAYOUT: usize = 256;
 
 impl AxTaskExt {
     /// Returns the expected size of the task extended structure.
@@ -54,8 +73,17 @@ impl AxTaskExt {
         let ptr = if size == 0 {
             core::ptr::null_mut()
         } else {
-            let layout = Layout::from_size_align(size, align).unwrap();
-            unsafe { alloc::alloc::alloc(layout) }
+            let cache_key = (size, align);
+            if let Some(ptr) = task_ext_cache()
+                .lock()
+                .get_mut(&cache_key)
+                .and_then(|cached| cached.pop())
+            {
+                ptr as *mut u8
+            } else {
+                let layout = Layout::from_size_align(size, align).unwrap();
+                unsafe { alloc::alloc::alloc(layout) }
+            }
         };
         Self { ptr }
     }
@@ -102,8 +130,24 @@ impl AxTaskExt {
 impl Drop for AxTaskExt {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            let layout = Layout::from_size_align(Self::size(), 0x10).unwrap();
-            unsafe { alloc::alloc::dealloc(self.ptr, layout) };
+            unsafe extern "C" {
+                fn __ax_task_ext_drop(ptr: *mut u8);
+            }
+            let layout = Layout::from_size_align(Self::size(), Self::align()).unwrap();
+            unsafe {
+                __ax_task_ext_drop(self.ptr);
+            };
+            let cache_key = (layout.size(), layout.align());
+            let mut cache = task_ext_cache().lock();
+            let entry = cache.entry(cache_key).or_default();
+            if entry.len() < TASK_EXT_CACHE_LIMIT_PER_LAYOUT {
+                entry.push(self.ptr as usize);
+            } else {
+                drop(cache);
+                unsafe {
+                    alloc::alloc::dealloc(self.ptr, layout);
+                };
+            };
         }
     }
 }
@@ -163,6 +207,13 @@ macro_rules! def_task_ext {
 
         #[unsafe(no_mangle)]
         static __AX_TASK_EXT_ALIGN: usize = ::core::mem::align_of::<$task_ext_struct>();
+
+        #[unsafe(no_mangle)]
+        unsafe extern "C" fn __ax_task_ext_drop(ptr: *mut u8) {
+            unsafe {
+                ::core::ptr::drop_in_place(ptr as *mut $task_ext_struct);
+            }
+        }
 
         impl $crate::TaskExtRef<$task_ext_struct> for $crate::TaskInner {
             fn task_ext(&self) -> &$task_ext_struct {

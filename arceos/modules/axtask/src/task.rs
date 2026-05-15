@@ -1,13 +1,11 @@
-use alloc::{boxed::Box, string::String, sync::Arc};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use core::ops::Deref;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use core::{alloc::Layout, cell::UnsafeCell, fmt, ptr::NonNull};
 
-#[cfg(feature = "preempt")]
-use core::sync::atomic::AtomicUsize;
-
+use axalloc::global_allocator;
 use kspin::SpinNoIrq;
-use memory_addr::{VirtAddr, align_up_4k};
+use memory_addr::{PAGE_SIZE_4K, VirtAddr, align_up_4k};
 
 use axhal::arch::TaskContext;
 #[cfg(feature = "tls")]
@@ -111,9 +109,28 @@ impl TaskInner {
     where
         F: FnOnce() + Send + 'static,
     {
+        Self::try_new(entry, name, stack_size)
+            .unwrap_or_else(|| panic!("TaskInner::new failed to allocate task resources"))
+    }
+
+    /// Try to create a new task with the given entry function and stack size.
+    pub fn try_new<F>(entry: F, name: String, stack_size: usize) -> Option<Self>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let available_bytes = global_allocator().available_bytes();
+        if available_bytes < 4096 {
+            warn!(
+                "TaskInner::new low byte allocator space: name={} stack_size={} available_bytes={} available_pages={}",
+                name,
+                stack_size,
+                available_bytes,
+                global_allocator().available_pages()
+            );
+        }
         let mut t = Self::new_common(TaskId::new(), name);
         debug!("new task: {}", t.id_name());
-        let kstack = TaskStack::alloc(align_up_4k(stack_size));
+        let kstack = TaskStack::try_alloc(align_up_4k(stack_size))?;
 
         #[cfg(feature = "tls")]
         let tls = VirtAddr::from(t.tls.tls_ptr() as usize);
@@ -126,7 +143,7 @@ impl TaskInner {
         if t.name() == "idle" {
             t.is_idle = true;
         }
-        t
+        Some(t)
     }
 
     /// Gets the ID of the task.
@@ -462,12 +479,95 @@ struct TaskStack {
     layout: Layout,
 }
 
+fn task_stack_cache() -> &'static SpinNoIrq<BTreeMap<(usize, usize), Vec<usize>>> {
+    static CACHE: lazyinit::LazyInit<SpinNoIrq<BTreeMap<(usize, usize), Vec<usize>>>> =
+        lazyinit::LazyInit::new();
+    if let Some(cache) = CACHE.get() {
+        cache
+    } else {
+        CACHE.init_once(SpinNoIrq::new(BTreeMap::new()))
+    }
+}
+
+const TASK_STACK_CACHE_LIMIT_PER_LAYOUT: usize = 32;
+static TASK_STACK_ALLOC_FAIL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn should_log_task_stack_alloc_failure() -> bool {
+    let slot = TASK_STACK_ALLOC_FAIL_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    slot <= 4 || slot.is_power_of_two()
+}
+
+pub fn reclaim_task_stack_cache(keep_per_layout: usize) -> usize {
+    let mut reclaimed = Vec::new();
+    {
+        let mut cache = task_stack_cache().lock();
+        for (&(size, _align), entries) in cache.iter_mut() {
+            let pages = size / PAGE_SIZE_4K;
+            while entries.len() > keep_per_layout {
+                let Some(ptr) = entries.pop() else {
+                    break;
+                };
+                reclaimed.push((ptr, pages));
+            }
+        }
+    }
+
+    let mut reclaimed_pages = 0;
+    for (ptr, pages) in reclaimed {
+        global_allocator().dealloc_pages(ptr, pages);
+        reclaimed_pages += pages;
+    }
+    reclaimed_pages
+}
+
 impl TaskStack {
     pub fn alloc(size: usize) -> Self {
-        let layout = Layout::from_size_align(size, 16).unwrap();
-        Self {
-            ptr: NonNull::new(unsafe { alloc::alloc::alloc(layout) }).unwrap(),
-            layout,
+        Self::try_alloc(size).unwrap_or_else(|| panic!("TaskStack::alloc failed"))
+    }
+
+    pub fn try_alloc(size: usize) -> Option<Self> {
+        let layout = Layout::from_size_align(size, PAGE_SIZE_4K).unwrap();
+        let cache_key = (layout.size(), layout.align());
+        if let Some(ptr) = task_stack_cache()
+            .lock()
+            .get_mut(&cache_key)
+            .and_then(|cached| cached.pop())
+        {
+            return Some(Self {
+                ptr: NonNull::new(ptr as *mut u8).expect("cached task stack pointer should be non-null"),
+                layout,
+            });
+        }
+        let num_pages = layout.size() / PAGE_SIZE_4K;
+        match global_allocator().alloc_pages(num_pages, PAGE_SIZE_4K) {
+            Ok(vaddr) => Some(Self {
+                ptr: NonNull::new(vaddr as *mut u8)
+                    .expect("allocated task stack pointer should be non-null"),
+                layout,
+            }),
+            Err(err) => {
+                let reclaimed_pages = reclaim_task_stack_cache(0);
+                if reclaimed_pages > 0 {
+                    if let Ok(vaddr) = global_allocator().alloc_pages(num_pages, PAGE_SIZE_4K) {
+                        return Some(Self {
+                            ptr: NonNull::new(vaddr as *mut u8)
+                                .expect("allocated task stack pointer should be non-null"),
+                            layout,
+                        });
+                    }
+                }
+                if should_log_task_stack_alloc_failure() {
+                    warn!(
+                        "TaskStack::alloc failed size={} available_bytes={} available_pages={} reclaimed_stack_pages={} err={:?}",
+                        size,
+                        global_allocator().available_bytes(),
+                        global_allocator().available_pages(),
+                        reclaimed_pages,
+                        err
+                    );
+                }
+                None
+            }
         }
     }
 
@@ -478,7 +578,16 @@ impl TaskStack {
 
 impl Drop for TaskStack {
     fn drop(&mut self) {
-        unsafe { alloc::alloc::dealloc(self.ptr.as_ptr(), self.layout) }
+        let cache_key = (self.layout.size(), self.layout.align());
+        let mut cache = task_stack_cache().lock();
+        let entry = cache.entry(cache_key).or_default();
+        if entry.len() < TASK_STACK_CACHE_LIMIT_PER_LAYOUT {
+            entry.push(self.ptr.as_ptr() as usize);
+        } else {
+            drop(cache);
+            global_allocator()
+                .dealloc_pages(self.ptr.as_ptr() as usize, self.layout.size() / PAGE_SIZE_4K);
+        }
     }
 }
 
