@@ -22,13 +22,22 @@
 extern crate alloc;
 
 use alloc::sync::Arc;
-use core::{alloc::Layout, fmt, ops::Deref};
+use core::{alloc::Layout, fmt, mem::size_of, ops::Deref};
 
 use lazyinit::LazyInit;
 
 unsafe extern "C" {
     fn __start_axns_resource();
     fn __stop_axns_resource();
+    fn __start_axns_drop();
+    fn __stop_axns_drop();
+}
+
+#[doc(hidden)]
+#[repr(C)]
+pub struct ResourceDropHook {
+    pub global_ptr: unsafe extern "C" fn() -> *const u8,
+    pub drop_in_place: unsafe extern "C" fn(*mut u8),
 }
 
 /// A namespace that contains all user-defined resources.
@@ -102,6 +111,23 @@ impl Drop for AxNamespace {
         if self.alloc {
             let size = Self::section_size();
             if size != 0 && !self.base.is_null() {
+                let hooks_start = __start_axns_drop as usize;
+                let hooks_end = __stop_axns_drop as usize;
+                if hooks_end > hooks_start {
+                    let hooks_len = (hooks_end - hooks_start) / size_of::<ResourceDropHook>();
+                    let hooks = unsafe {
+                        core::slice::from_raw_parts(
+                            hooks_start as *const ResourceDropHook,
+                            hooks_len,
+                        )
+                    };
+                    let global_base = __start_axns_resource as usize;
+                    for hook in hooks {
+                        let offset = unsafe { (hook.global_ptr)() as usize }.saturating_sub(global_base);
+                        let ptr = unsafe { self.base.add(offset) };
+                        unsafe { (hook.drop_in_place)(ptr) };
+                    }
+                }
                 let layout = Layout::from_size_align(size, 64).unwrap();
                 unsafe { alloc::alloc::dealloc(self.base, layout) };
             }
@@ -136,9 +162,26 @@ impl<T> ResArc<T> {
         self.0.init_once(data);
     }
 
+    /// Replaces the current resource with a new shared value.
+    pub fn replace_shared(&self, data: Arc<T>) {
+        if self.0.is_inited() {
+            unsafe {
+                let slot = self.0.deref() as *const Arc<T> as *mut Arc<T>;
+                core::ptr::replace(slot, data);
+            }
+        } else {
+            self.0.init_once(data);
+        }
+    }
+
     /// Checks whether the value is initialized.
     pub fn is_inited(&self) -> bool {
         self.0.is_inited()
+    }
+
+    /// Returns the strong reference count of the shared resource.
+    pub fn strong_count(&self) -> usize {
+        Arc::strong_count(self.0.deref())
     }
 }
 
@@ -227,49 +270,73 @@ macro_rules! def_resource {
             #[allow(non_camel_case_types)]
             $vis struct $name { __value: () }
 
-            impl $name {
-                unsafe fn deref_from_base(&self, ns_base: *mut u8) -> &$ty {
+            const _: () = {
+                #[unsafe(link_section = "axns_resource")]
+                static RES: $ty = $default;
+
+                unsafe extern "C" fn __axns_resource_global_ptr() -> *const u8 {
+                    &RES as *const _ as *const u8
+                }
+
+                unsafe extern "C" fn __axns_resource_offset() -> usize {
                     unsafe extern {
                         fn __start_axns_resource();
                     }
 
-                    #[unsafe(link_section = "axns_resource")]
-                    static RES: $ty = $default;
-
-                    let offset = &RES as *const _ as usize - __start_axns_resource as usize;
-                    let ptr = unsafe{ ns_base.add(offset) } as *const _;
-                    unsafe{ &*ptr }
+                    &RES as *const _ as usize - __start_axns_resource as usize
                 }
 
-                /// Dereference the resource from the given namespace.
-                pub fn deref_from(&self, ns: &$crate::AxNamespace) -> &$ty {
-                    unsafe { self.deref_from_base(ns.base()) }
+                unsafe extern "C" fn __axns_resource_drop(ptr: *mut u8) {
+                    unsafe {
+                        core::ptr::drop_in_place(ptr as *mut $ty);
+                    }
                 }
 
-                /// Dereference the resource from the global namespace.
-                pub fn deref_global(&self) -> &$ty {
-                    self.deref_from(&$crate::AxNamespace::global())
+                impl $name {
+                    unsafe fn deref_from_base(&self, ns_base: *mut u8) -> &$ty {
+                        let offset = __axns_resource_offset();
+                        let ptr = unsafe { ns_base.add(offset) } as *const _;
+                        unsafe { &*ptr }
+                    }
+
+                    /// Dereference the resource from the given namespace.
+                    pub fn deref_from(&self, ns: &$crate::AxNamespace) -> &$ty {
+                        unsafe { self.deref_from_base(ns.base()) }
+                    }
+
+                    /// Dereference the resource from the global namespace.
+                    pub fn deref_global(&self) -> &$ty {
+                        self.deref_from(&$crate::AxNamespace::global())
+                    }
+
+                    /// Dereference the resource automatically, according whether the
+                    /// `thread-local` feature of the `axns` crate is enabled or not.
+                    ///
+                    /// When the feature is enabled, it dereferences from the
+                    /// thread-local namespace of the current thread. Otherwise, it
+                    /// dereferences from the global namespace.
+                    pub fn deref_auto(&self) -> &$ty {
+                        unsafe { self.deref_from_base($crate::current_namespace_base()) }
+                    }
                 }
 
-                /// Dereference the resource automatically, according whether the
-                /// `thread-local` feature of the `axns` crate is enabled or not.
-                ///
-                /// When the feature is enabled, it dereferences from the
-                /// thread-local namespace of the current thread. Otherwise, it
-                /// dereferences from the global namespace.
-                pub fn deref_auto(&self) -> &$ty {
-                    unsafe { self.deref_from_base($crate::current_namespace_base()) }
-                }
-            }
+                impl core::ops::Deref for $name {
+                    type Target = $ty;
 
-            impl core::ops::Deref for $name {
-                type Target = $ty;
-
-                #[inline(never)]
-                fn deref(&self) -> &Self::Target {
-                    self.deref_auto()
+                    #[inline(never)]
+                    fn deref(&self) -> &Self::Target {
+                        self.deref_auto()
+                    }
                 }
-            }
+
+                #[used]
+                #[doc(hidden)]
+                #[unsafe(link_section = "axns_drop")]
+                static __AXNS_DROP_HOOK: $crate::ResourceDropHook = $crate::ResourceDropHook {
+                    global_ptr: __axns_resource_global_ptr,
+                    drop_in_place: __axns_resource_drop,
+                };
+            };
 
             #[used]
             #[doc(hidden)]
