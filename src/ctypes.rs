@@ -30,6 +30,8 @@ bitflags! {
         const CLONE_NEWNS = 1 << 17;
         /// 子任务共享同一组信号量。用于 sys_semop
         const CLONE_SYSVSEM = 1 << 18;
+        /// Share I/O context.
+        const CLONE_IO = 1 << 31;
         /// 要求设置 tls
         const CLONE_SETTLS = 1 << 19;
         /// 要求在父任务的一个地址写入子任务的 tid
@@ -44,8 +46,11 @@ bitflags! {
         const CLONE_CHILD_SETTID = 1 << 24;
         /// New pid namespace.
         const CLONE_NEWPID = 1 << 29;
+        /// New network namespace.
+        const CLONE_NEWNET = 1 << 30;
     }
 
+    #[derive(Debug, Clone, Copy)]
     pub struct WaitFlags: u32 {
         /// 不挂起当前进程，直接返回
         const WNOHANG = 1 << 0;
@@ -72,6 +77,7 @@ pub enum WaitStatus {
     NotExist,
 }
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Tms {
     /// 进程用户态执行时间，单位为us
     pub tms_utime: usize,
@@ -162,6 +168,7 @@ impl TimeStat {
         let delta = now_time_ns - self.kernel_timestamp;
         self.stime_ns += delta;
         self.user_timestamp = now_time_ns;
+        self.kernel_timestamp = now_time_ns;
         if self.timer_type == TimerType::REAL || self.timer_type == TimerType::PROF {
             self.update_timer(delta);
         }
