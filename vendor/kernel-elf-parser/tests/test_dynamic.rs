@@ -26,3 +26,33 @@ fn test_elf_parser() {
     }
     assert_eq!(segments[0].vaddr, VirtAddr::from_usize(0x1000));
 }
+
+#[test]
+fn test_exec_with_interp_keeps_absolute_vaddr() {
+    use memory_addr::VirtAddr;
+
+    let elf_bytes = include_bytes!("../../../embedded-runtime-refresh/la/musl/entry-dynamic.exe");
+    let mut aligned_elf_bytes = unsafe {
+        let ptr = elf_bytes.as_ptr() as *mut u8;
+        std::slice::from_raw_parts_mut(ptr, elf_bytes.len())
+    }
+    .to_vec();
+    if aligned_elf_bytes.len() % 16 != 0 {
+        let padding = vec![0u8; 16 - aligned_elf_bytes.len() % 16];
+        aligned_elf_bytes.extend(padding);
+    }
+    let elf =
+        xmas_elf::ElfFile::new(aligned_elf_bytes.as_slice()).expect("Failed to read elf file");
+
+    let interp_base = 0x4000_000;
+    let bias = Some(0x1000);
+    let elf_parser = kernel_elf_parser::ELFParser::new(&elf, interp_base, bias, 0).unwrap();
+
+    assert_eq!(elf_parser.base(), 0);
+    assert_eq!(elf_parser.phdr(), 0x1200_00040);
+    assert_eq!(elf_parser.entry(), 0x1200_1ddd4);
+
+    let segments = elf_parser.ph_load();
+    assert_eq!(segments[0].vaddr, VirtAddr::from_usize(0x1200_00000));
+    assert_eq!(segments[1].vaddr, VirtAddr::from_usize(0x1200_48000));
+}

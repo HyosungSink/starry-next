@@ -84,8 +84,12 @@ fn init_stack(args: &[String], envs: &[String], auxv: &mut [AuxvEntry], sp: usiz
     let padding_null = "\0".repeat(8);
     stack.push(padding_null.as_bytes(), &mut data);
 
-    stack.push("\0".repeat(stack.get_sp() % 16).as_bytes(), &mut data);
-    assert!(stack.get_sp() % 16 == 0);
+    let auxv_bytes = core::mem::size_of_val(auxv);
+    let pointer_bytes = (envs_slice.len() + argv_slice.len() + 3) * core::mem::size_of::<usize>();
+    let final_frame_bytes = auxv_bytes + pointer_bytes;
+    let align_padding = stack.get_sp().wrapping_sub(final_frame_bytes) % 16;
+    stack.push("\0".repeat(align_padding).as_bytes(), &mut data);
+    assert_eq!(stack.get_sp().wrapping_sub(final_frame_bytes) % 16, 0);
     // Push auxiliary vectors
     for auxv_entry in auxv.iter_mut() {
         if auxv_entry.get_type() == AuxvType::RANDOM {

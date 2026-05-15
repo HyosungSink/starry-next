@@ -33,8 +33,28 @@ pub struct ELFParser<'a> {
 }
 
 impl<'a> ELFParser<'a> {
+    fn elf_type(elf: &xmas_elf::ElfFile) -> Result<xmas_elf::header::Type, &'static str> {
+        let raw = elf
+            .input
+            .get(16..18)
+            .ok_or("ELF header too short for type")?;
+        let raw = match elf.header.pt1.data.as_data() {
+            xmas_elf::header::Data::LittleEndian => u16::from_le_bytes([raw[0], raw[1]]),
+            xmas_elf::header::Data::BigEndian => u16::from_be_bytes([raw[0], raw[1]]),
+            _ => return Err("Unsupported ELF data encoding"),
+        };
+        Ok(match raw {
+            0 => xmas_elf::header::Type::None,
+            1 => xmas_elf::header::Type::Relocatable,
+            2 => xmas_elf::header::Type::Executable,
+            3 => xmas_elf::header::Type::SharedObject,
+            4 => xmas_elf::header::Type::Core,
+            other => xmas_elf::header::Type::ProcessorSpecific(other),
+        })
+    }
+
     fn elf_base_addr(elf: &xmas_elf::ElfFile, interp_base: usize) -> Result<usize, &'static str> {
-        match elf.header.pt2.type_().as_type() {
+        match Self::elf_type(elf)? {
             // static
             xmas_elf::header::Type::Executable => Ok(0),
             // dynamic
@@ -74,15 +94,10 @@ impl<'a> ELFParser<'a> {
             return Err("invalid elf!");
         }
 
-        // Check if the ELF file is a Position Independent Executable (PIE)
-        let is_pie = elf.header.pt2.type_().as_type() == xmas_elf::header::Type::SharedObject
-            || (elf.header.pt2.type_().as_type() == xmas_elf::header::Type::Executable
-                && elf
-                    .program_iter()
-                    .any(|ph| ph.get_type() == Ok(xmas_elf::program::Type::Interp)));
+        let elf_type = Self::elf_type(elf)?;
 
         // If it is not PIE, and the lowest address is less than user space base, it is invalid.
-        if !is_pie
+        if elf_type != xmas_elf::header::Type::SharedObject
             && elf.program_iter().any(|ph| {
                 ph.get_type() == Ok(xmas_elf::program::Type::Load)
                     && ph.virtual_addr() < uspace_base as u64
@@ -91,10 +106,14 @@ impl<'a> ELFParser<'a> {
             return Err("Invalid ELF base address");
         }
 
-        let mut base = Self::elf_base_addr(elf, interp_base)?;
-        if is_pie {
-            base = base.wrapping_add(bias.unwrap_or(0) as usize);
-        }
+        let base = match elf_type {
+            xmas_elf::header::Type::Executable => 0,
+            xmas_elf::header::Type::SharedObject => {
+                Self::elf_base_addr(elf, interp_base)?
+                    .wrapping_add(bias.unwrap_or(0) as usize)
+            }
+            _ => return Err("Unsupported ELF type"),
+        };
         Ok(Self { elf, base })
     }
 
@@ -115,7 +134,24 @@ impl<'a> ELFParser<'a> {
 
     /// The offset of the program header table in the ELF file.
     pub fn phdr(&self) -> usize {
-        self.elf.header.pt2.ph_offset() as usize + self.base
+        if let Some(phdr) = self
+            .elf
+            .program_iter()
+            .find(|ph| ph.get_type() == Ok(xmas_elf::program::Type::Phdr))
+        {
+            return phdr.virtual_addr() as usize + self.base;
+        }
+
+        let phoff = self.elf.header.pt2.ph_offset() as usize;
+        if let Some(load) = self.elf.program_iter().find(|ph| {
+            ph.get_type() == Ok(xmas_elf::program::Type::Load)
+                && ph.offset() as usize <= phoff
+                && phoff < ph.offset() as usize + ph.file_size() as usize
+        }) {
+            return self.base + load.virtual_addr() as usize + phoff - load.offset() as usize;
+        }
+
+        phoff + self.base
     }
 
     /// The base address of the ELF file loaded into the memory.
