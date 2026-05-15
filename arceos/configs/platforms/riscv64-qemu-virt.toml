@@ -12,8 +12,8 @@ family = "riscv64-qemu-virt"        # str
 
 # Base address of the whole physical memory.
 phys-memory-base = 0x8000_0000      # uint
-# Size of the whole physical memory. (128M)
-phys-memory-size = 0x800_0000       # uint
+# Size of the whole physical memory. (1G)
+phys-memory-size = 0x4000_0000      # uint
 # Base physical address of the kernel image.
 kernel-base-paddr = 0x8020_0000     # uint
 # Base virtual address of the kernel image.
@@ -35,6 +35,7 @@ kernel-aspace-size = "0x0000_003f_ffff_f000"    # uint
 [devices]
 # MMIO regions with format (`base_paddr`, `size`).
 mmio-regions = [
+    [0x0010_0000, 0x1000],          # SiFive test finisher
     [0x0010_1000, 0x1000],          # RTC
     [0x0c00_0000, 0x21_0000],       # PLIC
     [0x1000_0000, 0x1000],          # UART

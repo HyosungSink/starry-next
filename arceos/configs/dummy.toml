@@ -24,19 +24,31 @@ phys-memory-size = 0        # uint
 # End address of the whole physical memory.
 phys-memory-end = 0         # uint
 # Base physical address of the kernel image.
-kernel-base-paddr = 0       # uint
+kernel-base-paddr = 0x8020_0000       # uint
 # Base virtual address of the kernel image.
-kernel-base-vaddr = 0       # uint
+kernel-base-vaddr = "0xffff_ffc0_8020_0000"       # uint
 # Linear mapping offset, for quick conversions between physical and virtual
 # addresses.
-phys-virt-offset = 0        # uint
+phys-virt-offset = "0xffff_ffc0_0000_0000"        # uint
 # Offset of bus address and phys address. some boards, the bus address is
 # different from the physical address.
 phys-bus-offset = 0         # uint
 # Kernel address space base.
-kernel-aspace-base = 0      # uint
+kernel-aspace-base = "0xffff_ffc0_0000_0000"      # uint
 # Kernel address space size.
-kernel-aspace-size = 0      # uint
+kernel-aspace-size = "0x0000_003f_ffff_f000"      # uint
+# The size of the kernel stack.
+kernel-stack-size = 0x10000       # uint
+# The base address of the user space.
+user-space-base = 0x1000         # uint
+# The base address for user interpreter.
+user-interp-base = 0x400_0000        # uint
+# The size of the user space.
+user-space-size = 0x3f_ffff_f000         # uint
+# The highest address of the user stack.
+user-stack-top = 0x4_0000_0000          # uint
+# The size of the user stack.
+user-stack-size = 0x4_0000         # uint
 
 #
 # Device specifications
