@@ -1,0 +1,3 @@
+cd ./basic
+./run-all.sh
+cd ..
