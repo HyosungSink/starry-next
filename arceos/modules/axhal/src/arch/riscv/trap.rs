@@ -16,25 +16,43 @@ fn handle_breakpoint(sepc: &mut usize) {
     *sepc += 2
 }
 
+#[inline(never)]
+fn terminate_unhandled_trap(tf: &TrapFrame, message: core::fmt::Arguments<'_>) -> ! {
+    error!("{}", message);
+    error!("{:#x?}", tf);
+    crate::misc::terminate_on_panic()
+}
+
 fn handle_page_fault(tf: &TrapFrame, mut access_flags: MappingFlags, is_user: bool) {
     if is_user {
         access_flags |= MappingFlags::USER;
     }
-    let vaddr = va!(stval::read());
+    let trap_value = stval::read();
+    let vaddr = va!(trap_value);
     if !handle_trap!(PAGE_FAULT, vaddr, access_flags, is_user) {
-        panic!(
-            "Unhandled {} Page Fault @ {:#x}, fault_vaddr={:#x} ({:?}):\n{:#x?}",
-            if is_user { "User" } else { "Supervisor" },
-            tf.sepc,
-            vaddr,
-            access_flags,
+        #[cfg(feature = "uspace")]
+        crate::trap::handle_user_trap_diagnostic(tf, scause::read().bits(), trap_value, is_user);
+        terminate_unhandled_trap(
             tf,
+            format_args!(
+                "Unhandled {} Page Fault @ {:#x}, fault_vaddr={:#x} ({:?}), from_user={}, scause={:#x}, stval={:#x}",
+                if is_user { "User" } else { "Supervisor" },
+                tf.sepc,
+                vaddr,
+                access_flags,
+                is_user,
+                scause::read().bits(),
+                trap_value,
+            ),
         );
     }
 }
 
 #[unsafe(no_mangle)]
 fn riscv_trap_handler(tf: &mut TrapFrame, from_user: bool) {
+    if from_user {
+        crate::trap::handle_user_enter();
+    }
     let scause = scause::read();
     if let Ok(cause) = scause.cause().try_into::<I, E>() {
         match cause {
@@ -57,15 +75,42 @@ fn riscv_trap_handler(tf: &mut TrapFrame, from_user: bool) {
                 handle_trap!(IRQ, scause.bits());
             }
             _ => {
-                panic!("Unhandled trap {:?} @ {:#x}:\n{:#x?}", cause, tf.sepc, tf);
+                #[cfg(feature = "uspace")]
+                crate::trap::handle_user_trap_diagnostic(
+                    tf,
+                    scause.bits(),
+                    stval::read(),
+                    from_user,
+                );
+                terminate_unhandled_trap(
+                    tf,
+                    format_args!(
+                        "Unhandled trap {:?} @ {:#x}, from_user={}, scause={:#x}, stval={:#x}",
+                        cause,
+                        tf.sepc,
+                        from_user,
+                        scause.bits(),
+                        stval::read()
+                    ),
+                );
             }
         }
     } else {
-        panic!(
-            "Unknown trap {:?} @ {:#x}:\n{:#x?}",
-            scause.cause(),
-            tf.sepc,
-            tf
+        #[cfg(feature = "uspace")]
+        crate::trap::handle_user_trap_diagnostic(tf, scause.bits(), stval::read(), from_user);
+        terminate_unhandled_trap(
+            tf,
+            format_args!(
+                "Unknown trap {:?} @ {:#x}, from_user={}, scause={:#x}, stval={:#x}",
+                scause.cause(),
+                tf.sepc,
+                from_user,
+                scause.bits(),
+                stval::read()
+            ),
         );
+    }
+    if from_user {
+        crate::trap::handle_user_return(tf);
     }
 }

@@ -81,6 +81,51 @@ impl TrapFrame {
     pub const fn arg5(&self) -> usize {
         self.regs.a5
     }
+
+    /// Gets the instruction pointer.
+    pub const fn get_ip(&self) -> usize {
+        self.sepc
+    }
+
+    /// Gets the stack pointer.
+    pub const fn get_sp(&self) -> usize {
+        self.regs.sp
+    }
+
+    /// Sets the instruction pointer.
+    pub fn set_ip(&mut self, pc: usize) {
+        self.sepc = pc;
+    }
+
+    /// Sets the stack pointer.
+    pub fn set_sp(&mut self, sp: usize) {
+        self.regs.sp = sp;
+    }
+
+    /// Sets the return address.
+    pub fn set_ra(&mut self, ra: usize) {
+        self.regs.ra = ra;
+    }
+
+    /// Sets the first argument / return value register.
+    pub fn set_arg0(&mut self, a0: usize) {
+        self.regs.a0 = a0;
+    }
+
+    /// Sets the second argument register.
+    pub fn set_arg1(&mut self, a1: usize) {
+        self.regs.a1 = a1;
+    }
+
+    /// Sets the third argument register.
+    pub fn set_arg2(&mut self, a2: usize) {
+        self.regs.a2 = a2;
+    }
+
+    /// Rewinds the PC so the trap epilogue lands back on the saved instruction.
+    pub fn rewind_pc_for_syscall(&mut self) {
+        self.sepc = self.sepc.wrapping_sub(4);
+    }
 }
 
 /// Context to enter user space.
@@ -99,6 +144,7 @@ impl UspaceContext {
     pub fn new(entry: usize, ustack_top: VirtAddr, arg0: usize) -> Self {
         const SPIE: usize = 1 << 5;
         const SUM: usize = 1 << 18;
+        const FS_DIRTY: usize = 0b11 << 13;
         Self(TrapFrame {
             regs: GeneralRegisters {
                 a0: arg0,
@@ -106,13 +152,18 @@ impl UspaceContext {
                 ..Default::default()
             },
             sepc: entry,
-            sstatus: SPIE | SUM,
+            sstatus: SPIE | SUM | FS_DIRTY,
         })
     }
 
     /// Creates a new context from the given [`TrapFrame`].
     pub const fn from(trap_frame: &TrapFrame) -> Self {
         Self(*trap_frame)
+    }
+
+    /// Returns the underlying saved trap frame.
+    pub const fn trap_frame(&self) -> &TrapFrame {
+        &self.0
     }
 
     /// Gets the instruction pointer.
@@ -138,6 +189,21 @@ impl UspaceContext {
     /// Sets the return value register.
     pub const fn set_retval(&mut self, a0: usize) {
         self.0.regs.a0 = a0;
+    }
+
+    /// Sets the first argument register after `a0`.
+    pub const fn set_arg1(&mut self, a1: usize) {
+        self.0.regs.a1 = a1;
+    }
+
+    /// Sets the second argument register after `a0`.
+    pub const fn set_arg2(&mut self, a2: usize) {
+        self.0.regs.a2 = a2;
+    }
+
+    /// Sets the user thread pointer register.
+    pub const fn set_thread_pointer(&mut self, tp: usize) {
+        self.0.regs.tp = tp;
     }
 
     /// Enters user space.
