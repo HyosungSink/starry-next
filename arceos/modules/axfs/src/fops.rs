@@ -1,9 +1,11 @@
 //! Low-level filesystem operations.
 
+use alloc::{string::String, vec::Vec};
 use axerrno::{AxError, AxResult, ax_err, ax_err_type};
 use axfs_vfs::{VfsError, VfsNodeRef};
 use axio::SeekFrom;
 use cap_access::{Cap, WithCap};
+use core::cmp::min;
 use core::fmt;
 
 #[cfg(feature = "myfs")]
@@ -25,6 +27,7 @@ pub struct File {
     node: WithCap<VfsNodeRef>,
     is_append: bool,
     offset: u64,
+    path: String,
 }
 
 /// An opened directory object, with open permissions and a cursor for
@@ -32,6 +35,8 @@ pub struct File {
 pub struct Directory {
     node: WithCap<VfsNodeRef>,
     entry_idx: usize,
+    dirents_cache: Option<Vec<DirEntry>>,
+    path: String,
 }
 
 /// Options and flags which can be used to configure how a file is opened.
@@ -46,6 +51,7 @@ pub struct OpenOptions {
     create: bool,
     create_new: bool,
     directory: bool,
+    path_only: bool,
     // system-specific
     _custom_flags: i32,
     _mode: u32,
@@ -64,6 +70,7 @@ impl OpenOptions {
             create: false,
             create_new: false,
             directory: false,
+            path_only: false,
             // system-specific
             _custom_flags: 0,
             _mode: 0o666,
@@ -101,6 +108,10 @@ impl OpenOptions {
     pub fn directory(&mut self, directory: bool) {
         self.directory = directory;
     }
+    /// Sets the option to open a path-only descriptor.
+    pub fn path_only(&mut self, path_only: bool) {
+        self.path_only = path_only;
+    }
     /// check whether contains directory.
     pub fn has_directory(&self) -> bool {
         self.directory
@@ -126,13 +137,16 @@ impl OpenOptions {
     }
 
     const fn is_valid(&self) -> bool {
+        if self.path_only {
+            return !(self.write || self.append || self.truncate || self.create || self.create_new);
+        }
         if !self.read && !self.write && !self.append && !self.directory {
             return false;
         }
         match (self.write, self.append) {
             (true, false) => {}
             (false, false) => {
-                if self.truncate || self.create || self.create_new {
+                if self.truncate {
                     return false;
                 }
             }
@@ -183,7 +197,9 @@ impl File {
             return ax_err!(IsADirectory);
         }
         let access_cap = opts.into();
-        if !perm_to_cap(attr.perm()).contains(access_cap) {
+        let resolved_path = crate::root::absolute_path(path).unwrap_or_else(|_| path.into());
+        if !opts.path_only && !perm_to_cap(resolved_path.as_str(), attr.perm()).contains(access_cap)
+        {
             return ax_err!(PermissionDenied);
         }
 
@@ -195,6 +211,7 @@ impl File {
             node: WithCap::new(node, access_cap),
             is_append: opts.append,
             offset: 0,
+            path: resolved_path,
         })
     }
 
@@ -207,6 +224,61 @@ impl File {
     /// Truncates the file to the specified size.
     pub fn truncate(&self, size: u64) -> AxResult {
         self.access_node(Cap::WRITE)?.truncate(size)?;
+        Ok(())
+    }
+
+    pub fn fallocate(&self, mode: u32, offset: u64, len: u64) -> AxResult {
+        let node = self.access_node(Cap::WRITE)?;
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| ax_err_type!(InvalidInput))?;
+        const FALLOC_FL_KEEP_SIZE: u32 = 0x01;
+        const FALLOC_FL_PUNCH_HOLE: u32 = 0x02;
+        const FALLOC_FL_PUNCH_HOLE_KEEP_SIZE: u32 = FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE;
+
+        #[cfg(feature = "ramfs")]
+        if let Some(file) = node.as_any().downcast_ref::<axfs_ramfs::FileNode>() {
+            return match mode {
+                0 => file.allocate_range(offset, len, false),
+                FALLOC_FL_KEEP_SIZE => file.allocate_range(offset, len, true),
+                FALLOC_FL_PUNCH_HOLE_KEEP_SIZE => file.punch_hole(offset, len),
+                _ => ax_err!(Unsupported),
+            };
+        }
+
+        if mode != 0 && mode != FALLOC_FL_KEEP_SIZE {
+            return if mode == FALLOC_FL_PUNCH_HOLE_KEEP_SIZE {
+                ax_err!(Unsupported)
+            } else {
+                ax_err!(Unsupported)
+            };
+        }
+
+        let original_size = node.get_attr()?.size();
+        if mode == 0 && end > original_size {
+            const MATERIALIZE_LIMIT: u64 = 16 * 1024 * 1024;
+            const MATERIALIZE_STEP: usize = 4096;
+            let materialize_len = end - original_size;
+            if materialize_len <= MATERIALIZE_LIMIT {
+                let zeros = [0u8; MATERIALIZE_STEP];
+                let mut pos = original_size;
+                while pos < end {
+                    let write_len = ((end - pos) as usize).min(MATERIALIZE_STEP);
+                    let written = node.write_at(pos, &zeros[..write_len])?;
+                    if written == 0 {
+                        return ax_err!(StorageFull);
+                    }
+                    pos = pos
+                        .checked_add(written as u64)
+                        .ok_or_else(|| ax_err_type!(InvalidInput))?;
+                }
+            } else {
+                let written = node.write_at(end - 1, &[0])?;
+                if written == 0 {
+                    return ax_err!(StorageFull);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -226,6 +298,12 @@ impl File {
     /// It does not update the file cursor.
     pub fn read_at(&self, offset: u64, buf: &mut [u8]) -> AxResult<usize> {
         let node = self.access_node(Cap::READ)?;
+        let read_len = node.read_at(offset, buf)?;
+        Ok(read_len)
+    }
+
+    pub fn read_at_for_exec(&self, offset: u64, buf: &mut [u8]) -> AxResult<usize> {
+        let node = self.access_node(Cap::empty())?;
         let read_len = node.read_at(offset, buf)?;
         Ok(read_len)
     }
@@ -263,14 +341,18 @@ impl File {
         Ok(())
     }
 
+    /// Updates whether writes should append to the end of file.
+    pub fn set_append(&mut self, append: bool) {
+        self.is_append = append;
+    }
+
     /// Sets the cursor of the file to the specified offset. Returns the new
     /// position after the seek.
     pub fn seek(&mut self, pos: SeekFrom) -> AxResult<u64> {
-        let size = self.get_attr()?.size();
         let new_offset = match pos {
             SeekFrom::Start(pos) => Some(pos),
             SeekFrom::Current(off) => self.offset.checked_add_signed(off),
-            SeekFrom::End(off) => size.checked_add_signed(off),
+            SeekFrom::End(off) => self.get_attr()?.size().checked_add_signed(off),
         }
         .ok_or_else(|| ax_err_type!(InvalidInput))?;
         self.offset = new_offset;
@@ -290,7 +372,7 @@ impl Directory {
 
     fn _open_dir_at(dir: Option<&VfsNodeRef>, path: &str, opts: &OpenOptions) -> AxResult<Self> {
         debug!("open dir: {}", path);
-        if !opts.read {
+        if !opts.read && !opts.path_only {
             return ax_err!(InvalidInput);
         }
         if opts.create || opts.create_new || opts.write || opts.append || opts.truncate {
@@ -303,7 +385,9 @@ impl Directory {
             return ax_err!(NotADirectory);
         }
         let access_cap = opts.into();
-        if !perm_to_cap(attr.perm()).contains(access_cap) {
+        let resolved_path = crate::root::absolute_path(path).unwrap_or_else(|_| path.into());
+        if !opts.path_only && !perm_to_cap(resolved_path.as_str(), attr.perm()).contains(access_cap)
+        {
             return ax_err!(PermissionDenied);
         }
 
@@ -311,6 +395,12 @@ impl Directory {
         Ok(Self {
             node: WithCap::new(node, access_cap),
             entry_idx: 0,
+            dirents_cache: None,
+            path: if resolved_path.ends_with('/') || resolved_path == "/" {
+                resolved_path
+            } else {
+                alloc::format!("{resolved_path}/")
+            },
         })
     }
 
@@ -318,7 +408,7 @@ impl Directory {
         if path.starts_with('/') {
             Ok(None)
         } else {
-            Ok(Some(self.access_node(Cap::EXECUTE)?))
+            Ok(Some(self.access_node(Cap::empty())?))
         }
     }
 
@@ -337,27 +427,62 @@ impl Directory {
     /// Opens a file at the path relative to this directory. Returns a [`File`]
     /// object.
     pub fn open_file_at(&self, path: &str, opts: &OpenOptions) -> AxResult<File> {
-        File::_open_at(self.access_at(path)?, path, opts)
+        let full_path = if path.starts_with('/') {
+            path.into()
+        } else if self.path == "/" {
+            alloc::format!("/{}", path)
+        } else {
+            alloc::format!("{}{}", self.path, path)
+        };
+        File::_open_at(self.access_at(path)?, full_path.as_str(), opts)
     }
 
     /// Creates an empty file at the path relative to this directory.
     pub fn create_file(&self, path: &str) -> AxResult<VfsNodeRef> {
-        crate::root::create_file(self.access_at(path)?, path)
+        let full_path = if path.starts_with('/') {
+            path.into()
+        } else if self.path == "/" {
+            alloc::format!("/{}", path)
+        } else {
+            alloc::format!("{}{}", self.path, path)
+        };
+        crate::root::create_file(self.access_at(path)?, full_path.as_str())
     }
 
     /// Creates an empty directory at the path relative to this directory.
     pub fn create_dir(&self, path: &str) -> AxResult {
-        crate::root::create_dir(self.access_at(path)?, path)
+        let full_path = if path.starts_with('/') {
+            path.into()
+        } else if self.path == "/" {
+            alloc::format!("/{}", path)
+        } else {
+            alloc::format!("{}{}", self.path, path)
+        };
+        crate::root::create_dir(self.access_at(path)?, full_path.as_str())
     }
 
     /// Removes a file at the path relative to this directory.
     pub fn remove_file(&self, path: &str) -> AxResult {
-        crate::root::remove_file(self.access_at(path)?, path)
+        let full_path = if path.starts_with('/') {
+            path.into()
+        } else if self.path == "/" {
+            alloc::format!("/{}", path)
+        } else {
+            alloc::format!("{}{}", self.path, path)
+        };
+        crate::root::remove_file(self.access_at(path)?, full_path.as_str())
     }
 
     /// Removes a directory at the path relative to this directory.
     pub fn remove_dir(&self, path: &str) -> AxResult {
-        crate::root::remove_dir(self.access_at(path)?, path)
+        let full_path = if path.starts_with('/') {
+            path.into()
+        } else if self.path == "/" {
+            alloc::format!("/{}", path)
+        } else {
+            alloc::format!("{}{}", self.path, path)
+        };
+        crate::root::remove_dir(self.access_at(path)?, full_path.as_str())
     }
 
     /// Reads directory entries starts from the current position into the
@@ -366,11 +491,43 @@ impl Directory {
     /// After the read, the cursor will be advanced by the number of entries
     /// read.
     pub fn read_dir(&mut self, dirents: &mut [DirEntry]) -> AxResult<usize> {
-        let n = self
-            .access_node(Cap::READ)?
-            .read_dir(self.entry_idx, dirents)?;
-        self.entry_idx += n;
-        Ok(n)
+        const DIR_READ_CACHE_BATCH: usize = 64;
+
+        if self.dirents_cache.is_none() {
+            let mut cached = Vec::new();
+            let mut start_idx = 0usize;
+            loop {
+                let mut batch: [DirEntry; DIR_READ_CACHE_BATCH] =
+                    core::array::from_fn(|_| DirEntry::default());
+                let read = self
+                    .access_node(Cap::READ)?
+                    .read_dir(start_idx, &mut batch)?;
+                if read == 0 {
+                    break;
+                }
+                for entry in &batch[..read] {
+                    let name = core::str::from_utf8(entry.name_as_bytes())
+                        .map_err(|_| AxError::InvalidData)?;
+                    cached.push(DirEntry::new(name, entry.entry_type()));
+                }
+                start_idx += read;
+            }
+            self.dirents_cache = Some(cached);
+        }
+
+        let cached = self.dirents_cache.as_ref().unwrap();
+        if self.entry_idx >= cached.len() {
+            return Ok(0);
+        }
+
+        let read = min(dirents.len(), cached.len() - self.entry_idx);
+        for (out, entry) in dirents.iter_mut().zip(&cached[self.entry_idx..]).take(read) {
+            let name =
+                core::str::from_utf8(entry.name_as_bytes()).map_err(|_| AxError::InvalidData)?;
+            *out = DirEntry::new(name, entry.entry_type());
+        }
+        self.entry_idx += read;
+        Ok(read)
     }
 
     /// Rename a file or directory to a new name.
@@ -415,12 +572,16 @@ impl fmt::Debug for OpenOptions {
         fmt_opt!(truncate, "TRUNC");
         fmt_opt!(create, "CREATE");
         fmt_opt!(create_new, "CREATE_NEW");
+        fmt_opt!(path_only, "PATH");
         Ok(())
     }
 }
 
 impl From<&OpenOptions> for Cap {
     fn from(opts: &OpenOptions) -> Cap {
+        if opts.path_only {
+            return Cap::empty();
+        }
         let mut cap = Cap::empty();
         if opts.read {
             cap |= Cap::READ;
@@ -435,16 +596,7 @@ impl From<&OpenOptions> for Cap {
     }
 }
 
-fn perm_to_cap(perm: FilePerm) -> Cap {
-    let mut cap = Cap::empty();
-    if perm.owner_readable() {
-        cap |= Cap::READ;
-    }
-    if perm.owner_writable() {
-        cap |= Cap::WRITE;
-    }
-    if perm.owner_executable() {
-        cap |= Cap::EXECUTE;
-    }
-    cap
+fn perm_to_cap(path: &str, perm: FilePerm) -> Cap {
+    let attr = axfs_vfs::VfsNodeAttr::new(perm, FileType::File, 0, 0);
+    crate::root::access_caps(path, attr, false)
 }
