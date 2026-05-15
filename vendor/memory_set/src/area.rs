@@ -9,6 +9,7 @@ use crate::{MappingBackend, MappingError, MappingResult};
 ///
 /// The target physical memory frames are determined by [`MappingBackend`] and
 /// may not be contiguous.
+#[repr(C)]
 pub struct MemoryArea<B: MappingBackend> {
     va_range: AddrRange<B::Addr>,
     flags: B::Flags,
@@ -66,6 +67,11 @@ impl<B: MappingBackend> MemoryArea<B> {
         self.flags = new_flags;
     }
 
+    /// Changes the backend.
+    pub fn set_backend(&mut self, new_backend: B) {
+        self.backend = new_backend;
+    }
+
     /// Changes the end address of the memory area.
     pub(crate) fn set_end(&mut self, new_end: B::Addr) {
         self.va_range.end = new_end;
@@ -111,6 +117,7 @@ impl<B: MappingBackend> MemoryArea<B> {
     ) -> MappingResult {
         assert!(new_size > 0 && new_size < self.size());
 
+        let old_start = self.start();
         let old_size = self.size();
         let unmap_size = old_size - new_size;
 
@@ -121,6 +128,9 @@ impl<B: MappingBackend> MemoryArea<B> {
         // Safety: `unmap_size` is less than the current size, so it will never
         // overflow.
         self.va_range.start = self.va_range.start.wrapping_add(unmap_size);
+        self.backend = self
+            .backend
+            .clone_for_range(old_start, self.start(), self.size());
         Ok(())
     }
 
@@ -136,6 +146,7 @@ impl<B: MappingBackend> MemoryArea<B> {
         page_table: &mut B::PageTable,
     ) -> MappingResult {
         assert!(new_size > 0 && new_size < self.size());
+        let old_start = self.start();
         let old_size = self.size();
         let unmap_size = old_size - new_size;
 
@@ -149,6 +160,9 @@ impl<B: MappingBackend> MemoryArea<B> {
 
         // Use wrapping_sub to avoid overflow check, same as above.
         self.va_range.end = self.va_range.end.wrapping_sub(unmap_size);
+        self.backend = self
+            .backend
+            .clone_for_range(old_start, self.start(), self.size());
         Ok(())
     }
 
@@ -161,15 +175,18 @@ impl<B: MappingBackend> MemoryArea<B> {
     /// of the parts is empty after splitting.
     pub(crate) fn split(&mut self, pos: B::Addr) -> Option<Self> {
         if self.start() < pos && pos < self.end() {
+            let old_start = self.start();
+            let right_size = self.end().wrapping_sub_addr(pos);
             let new_area = Self::new(
                 pos,
-                // Use wrapping_sub_addr to avoid overflow check. It is safe because
-                // `pos` is within the memory area.
-                self.end().wrapping_sub_addr(pos),
+                right_size,
                 self.flags,
-                self.backend.clone(),
+                self.backend.clone_for_range(old_start, pos, right_size),
             );
             self.va_range.end = pos;
+            self.backend = self
+                .backend
+                .clone_for_range(old_start, self.start(), self.size());
             Some(new_area)
         } else {
             None

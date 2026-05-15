@@ -35,4 +35,14 @@ pub trait MappingBackend: Clone {
         new_flags: Self::Flags,
         page_table: &mut Self::PageTable,
     ) -> bool;
+
+    /// Clone the backend state for a sub-range of an existing area.
+    fn clone_for_range(
+        &self,
+        _old_start: Self::Addr,
+        _new_start: Self::Addr,
+        _new_size: usize,
+    ) -> Self {
+        self.clone()
+    }
 }

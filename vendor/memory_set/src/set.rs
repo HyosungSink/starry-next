@@ -8,6 +8,7 @@ use memory_addr::{AddrRange, MemoryAddr};
 use crate::{MappingBackend, MappingError, MappingResult, MemoryArea};
 
 /// A container that maintains memory mappings ([`MemoryArea`]).
+#[repr(transparent)]
 pub struct MemorySet<B: MappingBackend> {
     areas: BTreeMap<B::Addr, MemoryArea<B>>,
 }
@@ -33,6 +34,11 @@ impl<B: MappingBackend> MemorySet<B> {
     /// Returns the iterator over all memory areas.
     pub fn iter(&self) -> impl Iterator<Item = &MemoryArea<B>> {
         self.areas.values()
+    }
+
+    /// Returns the mutable iterator over all memory areas.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut MemoryArea<B>> {
+        self.areas.values_mut()
     }
 
     /// Returns whether the given address range overlaps with any existing area.
@@ -69,13 +75,19 @@ impl<B: MappingBackend> MemorySet<B> {
         size: usize,
         limit: AddrRange<B::Addr>,
     ) -> Option<B::Addr> {
-        // brute force: try each area's end address as the start.
         let mut last_end = hint.max(limit.start);
-        for (&addr, area) in self.areas.iter() {
+        if let Some((_, before)) = self.areas.range(..=last_end).last() {
+            if before.end() > last_end {
+                last_end = before.end();
+            }
+        }
+        for (&addr, area) in self.areas.range(last_end..) {
             if last_end.checked_add(size).is_some_and(|end| end <= addr) {
                 return Some(last_end);
             }
-            last_end = area.end();
+            if area.end() > last_end {
+                last_end = area.end();
+            }
         }
         if last_end
             .checked_add(size)
