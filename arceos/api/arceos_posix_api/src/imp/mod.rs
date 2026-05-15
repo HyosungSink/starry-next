@@ -7,6 +7,8 @@ pub mod task;
 pub mod time;
 
 #[cfg(feature = "fd")]
+pub mod eventfd;
+#[cfg(feature = "fd")]
 pub mod fd_ops;
 #[cfg(feature = "fs")]
 pub mod fs;
