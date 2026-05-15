@@ -39,11 +39,12 @@ pub fn set_oneshot_timer(deadline_ns: u64) {
     use loongArch64::register::tcfg;
 
     let ticks_now = current_ticks();
-    let ticks_deadline = nanos_to_ticks(deadline_ns);
-    let init_value = ticks_deadline - ticks_now;
+    let min_deadline_ns = ticks_to_nanos(ticks_now).saturating_add(NANOS_PER_TICK);
+    let ticks_deadline = nanos_to_ticks(deadline_ns.max(min_deadline_ns));
+    let init_value = ticks_deadline.saturating_sub(ticks_now);
 
     // This initial value must be an integer multiple of 4.
-    tcfg::set_init_val(((init_value + 3) & !3) as _);
+    tcfg::set_init_val(((init_value.max(4) + 3) & !3) as _);
     tcfg::set_periodic(false);
     tcfg::set_en(true);
 }

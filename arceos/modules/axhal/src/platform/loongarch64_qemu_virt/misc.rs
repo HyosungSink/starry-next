@@ -13,3 +13,7 @@ pub fn terminate() -> ! {
         crate::arch::halt();
     }
 }
+
+pub fn terminate_on_panic() -> ! {
+    terminate()
+}
