@@ -1,4 +1,7 @@
 fn main() {
+    use std::env;
+    use std::path::PathBuf;
+
     fn gen_c_to_rust_bindings(in_file: &str, out_file: &str) {
         println!("cargo:rerun-if-changed={in_file}");
 
@@ -20,5 +23,17 @@ fn main() {
             .expect("Couldn't write bindings!");
     }
 
-    gen_c_to_rust_bindings("ctypes.h", "src/libctypes_gen.rs");
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("missing OUT_DIR"));
+    let ctypes_header = manifest_dir.join("ctypes.h");
+    let ctypes_rust = out_dir.join("libctypes_gen.rs");
+
+    gen_c_to_rust_bindings(
+        ctypes_header
+            .to_str()
+            .expect("ctypes header path is not valid UTF-8"),
+        ctypes_rust
+            .to_str()
+            .expect("ctypes rust path is not valid UTF-8"),
+    );
 }
