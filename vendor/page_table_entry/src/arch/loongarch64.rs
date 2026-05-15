@@ -92,12 +92,12 @@ impl From<MappingFlags> for PTEFlags {
         if f.is_empty() {
             return Self::empty();
         }
-        let mut ret = Self::V | Self::P | Self::D;
+        let mut ret = Self::V | Self::P;
         if !f.contains(MappingFlags::READ) {
             ret |= Self::NR;
         }
         if f.contains(MappingFlags::WRITE) {
-            ret |= Self::W;
+            ret |= Self::W | Self::D;
         }
         if !f.contains(MappingFlags::EXECUTE) {
             ret |= Self::NX;
