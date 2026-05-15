@@ -7,3 +7,6 @@
 apps/*/build/
 **/target/
 /.axconfig.*
+/.axconfig.toml
+/arceos/ulib/axlibc/include/ax_pthread_mutex.h
+/vendor/lwext4_rust/c/lwext4/liblwext4-*.a
