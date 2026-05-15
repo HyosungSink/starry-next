@@ -27,8 +27,11 @@ pub fn sys_sysconf(name: c_int) -> c_long {
         match name as u32 {
             // Page size
             ctypes::_SC_PAGE_SIZE => Ok(PAGE_SIZE_4K),
+            // Number of configured processors
+            ctypes::_SC_NPROCESSORS_CONF => Ok(axconfig::SMP),
             // Number of processors in use
             ctypes::_SC_NPROCESSORS_ONLN => Ok(axconfig::SMP),
+            ctypes::_SC_CLK_TCK => Ok(100),
             // Total physical pages
             ctypes::_SC_PHYS_PAGES => Ok(phys_pages),
             // Avaliable physical pages
