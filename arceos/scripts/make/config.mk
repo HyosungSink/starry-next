@@ -24,8 +24,8 @@ else
 endif
 
 _axconfig-gen:
-ifeq ($(shell axconfig-gen --version 2>/dev/null),)
-	$(call run_cmd,RUSTFLAGS="" cargo,install axconfig-gen)
+ifeq ($(shell command -v axconfig-gen >/dev/null 2>&1 && axconfig-gen --version 2>/dev/null),)
+	$(call run_cmd,RUSTFLAGS="" cargo,install --force axconfig-gen)
 endif
 
 .PHONY: _axconfig-gen

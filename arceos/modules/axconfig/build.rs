@@ -7,6 +7,7 @@ fn main() {
     } else {
         let root_path = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         let dummy_config = Path::new(&root_path).join("../../configs/dummy.toml");
+        println!("cargo:rerun-if-changed={}", dummy_config.display());
         println!("cargo:rustc-env=AX_CONFIG_PATH={}", dummy_config.display());
     }
 }
