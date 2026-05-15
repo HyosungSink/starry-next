@@ -34,6 +34,9 @@ fn handle_page_fault(tf: &TrapFrame, mut access_flags: MappingFlags, is_user: bo
 
 #[unsafe(no_mangle)]
 fn loongarch64_trap_handler(tf: &mut TrapFrame, from_user: bool) {
+    if from_user {
+        crate::trap::handle_user_enter();
+    }
     let estat = estat::read();
 
     match estat.cause() {
@@ -42,12 +45,23 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame, from_user: bool) {
             tf.regs[4] = crate::trap::handle_syscall(tf, tf.regs[11]) as usize;
             tf.era += 4;
         }
-        Trap::Exception(Exception::LoadPageFault) | Trap::Exception(Exception::FetchPageFault) => {
+        Trap::Exception(Exception::LoadPageFault)
+        | Trap::Exception(Exception::PageNonReadableFault) => {
             handle_page_fault(tf, MappingFlags::READ, from_user)
         }
-        Trap::Exception(Exception::StorePageFault) => {
+        Trap::Exception(Exception::StorePageFault)
+        | Trap::Exception(Exception::PageModifyFault) => {
             handle_page_fault(tf, MappingFlags::WRITE, from_user)
         }
+        Trap::Exception(Exception::FetchPageFault)
+        | Trap::Exception(Exception::PageNonExecutableFault) => {
+            handle_page_fault(tf, MappingFlags::EXECUTE, from_user)
+        }
+        Trap::Exception(Exception::PagePrivilegeIllegal) => handle_page_fault(
+            tf,
+            MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
+            from_user,
+        ),
         Trap::Exception(Exception::Breakpoint) => handle_breakpoint(&mut tf.era),
         Trap::Interrupt(_) => {
             let irq_num: usize = estat.is().trailing_zeros() as usize;
@@ -61,5 +75,8 @@ fn loongarch64_trap_handler(tf: &mut TrapFrame, from_user: bool) {
                 tf
             );
         }
+    }
+    if from_user {
+        crate::trap::handle_user_return(tf);
     }
 }
