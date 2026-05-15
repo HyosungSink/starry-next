@@ -3,6 +3,7 @@
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::ops::{Deref, DerefMut};
+use core::panic::Location;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use axtask::{WaitQueue, current};
@@ -64,12 +65,19 @@ impl<T: ?Sized> Mutex<T> {
         self.owner_id.load(Ordering::Relaxed) != 0
     }
 
+    #[inline(always)]
+    pub fn is_owned_by_current(&self) -> bool {
+        self.owner_id.load(Ordering::Relaxed) == current().id().as_u64()
+    }
+
     /// Locks the [`Mutex`] and returns a guard that permits access to the inner data.
     ///
     /// The returned value may be dereferenced for data access
     /// and the lock will be dropped when the guard falls out of scope.
+    #[track_caller]
     pub fn lock(&self) -> MutexGuard<T> {
         let current_id = current().id().as_u64();
+        let caller = Location::caller();
         loop {
             // Can fail to lock even if the spinlock is not locked. May be more efficient than `try_lock`
             // when called in a loop.
@@ -84,8 +92,11 @@ impl<T: ?Sized> Mutex<T> {
                     assert_ne!(
                         owner_id,
                         current_id,
-                        "{} tried to acquire mutex it already owns.",
-                        current().id_name()
+                        "{} tried to acquire mutex it already owns at {}:{} (mutex={:p}).",
+                        current().id_name(),
+                        caller.file(),
+                        caller.line(),
+                        self
                     );
                     // Wait until the lock looks unlocked before retrying
                     self.wq.wait_until(|| !self.is_locked());
@@ -145,6 +156,17 @@ impl<T: ?Sized> Mutex<T> {
     pub fn get_mut(&mut self) -> &mut T {
         // We know statically that there are no other references to `self`, so
         // there's no need to lock the inner mutex.
+        unsafe { &mut *self.data.get() }
+    }
+
+    /// Returns a mutable reference to the underlying data without locking.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the mutex is already owned by the current task,
+    /// or otherwise guarantee exclusive access to the protected data.
+    #[inline(always)]
+    pub unsafe fn get_mut_unchecked(&self) -> &mut T {
         unsafe { &mut *self.data.get() }
     }
 }
