@@ -20,7 +20,7 @@ impl FilePath {
     pub fn new<P: AsRef<str>>(path: P) -> AxResult<Self> {
         let path = path.as_ref();
         let canonical = canonicalize(path).map_err(|_| AxError::NotFound)?;
-        let mut new_path = canonical.trim().to_string();
+        let mut new_path = canonical;
 
         // 如果原始路径以 '/' 结尾，那么规范化后的路径也应以 '/' 结尾
         if path.ends_with('/') && !new_path.ends_with('/') {
@@ -343,8 +343,7 @@ fn handle_empty_path(dir_fd: isize) -> AxResult<String> {
         return Ok(String::from("."));
     }
 
-    let fd_table = FD_TABLE.write();
-    if dir_fd >= fd_table.count() as isize || dir_fd < 0 {
+    if dir_fd < 0 || dir_fd >= FD_TABLE.read().count() as isize {
         axlog::warn!("文件描述符索引超出范围");
         return Err(AxError::InvalidInput);
     }
@@ -354,15 +353,17 @@ fn handle_empty_path(dir_fd: isize) -> AxResult<String> {
 }
 
 fn handle_relative_path(dir_fd: isize, path: &str) -> AxResult<String> {
-    let fd_table = FD_TABLE.write();
-    if dir_fd >= fd_table.count() as isize || dir_fd < 0 {
+    if dir_fd < 0 || dir_fd >= FD_TABLE.read().count() as isize {
         axlog::warn!("文件描述符索引超出范围");
         return Err(AxError::InvalidInput);
     }
     match super::fs::Directory::from_fd(dir_fd as i32) {
         Ok(dir) => {
-            // 假设目录路径以 '/' 结尾，无需手动添加
-            let combined_path = format!("{}{}", dir.path(), path);
+            let combined_path = if dir.path().ends_with('/') {
+                format!("{}{}", dir.path(), path)
+            } else {
+                format!("{}/{}", dir.path(), path)
+            };
             axlog::info!("处理后的路径: {} (目录: {})", combined_path, dir.path());
             Ok(combined_path)
         }
@@ -375,8 +376,11 @@ fn handle_relative_path(dir_fd: isize, path: &str) -> AxResult<String> {
 
 fn prepend_cwd(path: &str) -> AxResult<String> {
     let cwd = current_dir().map_err(|_| AxError::NotFound)?;
-    debug_assert!(cwd.ends_with('/'), "当前工作目录路径应以 '/' 结尾");
-    Ok(format!("{}{}", cwd, path))
+    if cwd == "/" {
+        Ok(format!("/{path}"))
+    } else {
+        Ok(format!("{cwd}/{path}"))
+    }
 }
 
 /// 根据 `force_dir` 和路径结尾调整路径
