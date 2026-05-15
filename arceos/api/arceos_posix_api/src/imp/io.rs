@@ -13,6 +13,9 @@ use axio::prelude::*;
 pub fn sys_read(fd: c_int, buf: *mut c_void, count: usize) -> ctypes::ssize_t {
     debug!("sys_read <= {} {:#x} {}", fd, buf as usize, count);
     syscall_body!(sys_read, {
+        if count == 0 {
+            return Ok(0);
+        }
         if buf.is_null() {
             return Err(LinuxError::EFAULT);
         }
@@ -36,6 +39,9 @@ pub fn sys_read(fd: c_int, buf: *mut c_void, count: usize) -> ctypes::ssize_t {
 pub fn sys_write(fd: c_int, buf: *const c_void, count: usize) -> ctypes::ssize_t {
     debug!("sys_write <= {} {:#x} {}", fd, buf as usize, count);
     syscall_body!(sys_write, {
+        if count == 0 {
+            return Ok(0);
+        }
         if buf.is_null() {
             return Err(LinuxError::EFAULT);
         }
@@ -62,9 +68,23 @@ pub unsafe fn sys_writev(fd: c_int, iov: *const ctypes::iovec, iocnt: c_int) -> 
         }
 
         let iovs = unsafe { core::slice::from_raw_parts(iov, iocnt as usize) };
-        let mut ret = 0;
+        let mut ret = 0isize;
         for iov in iovs.iter() {
-            ret += sys_write(fd, iov.iov_base, iov.iov_len);
+            if iov.iov_len == 0 {
+                continue;
+            }
+            let written = sys_write(fd, iov.iov_base, iov.iov_len) as isize;
+            if written < 0 {
+                if ret != 0 {
+                    return Ok(ret);
+                }
+                let errno = LinuxError::try_from((-written) as i32).unwrap_or(LinuxError::EIO);
+                return Err(errno);
+            }
+            ret += written;
+            if written as usize != iov.iov_len {
+                return Ok(ret);
+            }
         }
 
         Ok(ret)

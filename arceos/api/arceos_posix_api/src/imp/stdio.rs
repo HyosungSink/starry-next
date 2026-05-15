@@ -5,7 +5,7 @@ use axsync::Mutex;
 #[cfg(feature = "fd")]
 use {alloc::sync::Arc, axerrno::LinuxError, axerrno::LinuxResult, axio::PollState};
 
-fn console_read_bytes(buf: &mut [u8]) -> AxResult<usize> {
+pub(crate) fn console_read_bytes(buf: &mut [u8]) -> AxResult<usize> {
     let len = axhal::console::read_bytes(buf);
     for c in &mut buf[..len] {
         if *c == b'\r' {
@@ -15,7 +15,7 @@ fn console_read_bytes(buf: &mut [u8]) -> AxResult<usize> {
     Ok(len)
 }
 
-fn console_write_bytes(buf: &[u8]) -> AxResult<usize> {
+pub(crate) fn console_write_bytes(buf: &[u8]) -> AxResult<usize> {
     axhal::console::write_bytes(buf);
     Ok(buf.len())
 }
@@ -54,7 +54,7 @@ pub struct Stdin {
 
 impl Stdin {
     // Block until at least one byte is read.
-    fn read_blocked(&self, buf: &mut [u8]) -> AxResult<usize> {
+    pub(crate) fn read_blocked(&self, buf: &mut [u8]) -> AxResult<usize> {
         let read_len = self.inner.lock().read(buf)?;
         if buf.is_empty() || read_len > 0 {
             return Ok(read_len);
@@ -68,6 +68,14 @@ impl Stdin {
             crate::sys_sched_yield();
         }
     }
+}
+
+pub(crate) fn tty_read_blocked(buf: &mut [u8]) -> AxResult<usize> {
+    stdin().read_blocked(buf)
+}
+
+pub(crate) fn tty_write(buf: &[u8]) -> AxResult<usize> {
+    console_write_bytes(buf)
 }
 
 impl Read for Stdin {
@@ -118,6 +126,7 @@ impl super::fd_ops::FileLike for Stdin {
             st_ino: 1,
             st_nlink: 1,
             st_mode,
+            st_rdev: ((5u64 & 0xfff) << 8),
             ..Default::default()
         })
     }
@@ -154,6 +163,7 @@ impl super::fd_ops::FileLike for Stdout {
             st_ino: 1,
             st_nlink: 1,
             st_mode,
+            st_rdev: ((5u64 & 0xfff) << 8),
             ..Default::default()
         })
     }
