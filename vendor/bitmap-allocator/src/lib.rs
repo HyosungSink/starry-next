@@ -134,6 +134,14 @@ impl<T: BitAlloc> BitAlloc for BitAllocCascade16<T> {
     }
 
     fn dealloc(&mut self, key: usize) -> bool {
+        if key >= Self::CAP {
+            log::warn!(
+                "BitAllocCascade::dealloc out of range key={} cap={}",
+                key,
+                Self::CAP
+            );
+            return false;
+        }
         let i = key / T::CAP;
         self.bitset.set_bit(i, true);
         self.sub[i].dealloc(key % T::CAP)
@@ -274,6 +282,10 @@ impl BitAlloc for BitAlloc16 {
     }
 
     fn dealloc(&mut self, key: usize) -> bool {
+        if key >= Self::CAP {
+            log::warn!("BitAlloc16::dealloc out of range key={} cap={}", key, Self::CAP);
+            return false;
+        }
         let success = !self.test(key);
         self.0.set_bit(key, true);
         success

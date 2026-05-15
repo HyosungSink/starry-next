@@ -39,3 +39,6 @@ path = "src/lib.rs"
 
 [dependencies.bit_field]
 version = "0.10"
+
+[dependencies.log]
+version = "0.4"
