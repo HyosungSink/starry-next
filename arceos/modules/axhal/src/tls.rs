@@ -55,6 +55,9 @@ use memory_addr::align_up;
 
 use core::alloc::Layout;
 use core::ptr::NonNull;
+use alloc::vec::Vec;
+use kspin::SpinNoIrq;
+use lazyinit::LazyInit;
 
 const TLS_ALIGN: usize = 0x10;
 
@@ -86,10 +89,27 @@ pub struct TlsArea {
     layout: Layout,
 }
 
+const TLS_CACHE_LIMIT: usize = 64;
+
+fn tls_cache() -> &'static SpinNoIrq<Vec<usize>> {
+    static CACHE: LazyInit<SpinNoIrq<Vec<usize>>> = LazyInit::new();
+    if let Some(cache) = CACHE.get() {
+        cache
+    } else {
+        CACHE.init_once(SpinNoIrq::new(Vec::new()))
+    }
+}
+
 impl Drop for TlsArea {
     fn drop(&mut self) {
-        unsafe {
-            alloc::alloc::dealloc(self.base.as_ptr(), self.layout);
+        let mut cache = tls_cache().lock();
+        if cache.len() < TLS_CACHE_LIMIT {
+            cache.push(self.base.as_ptr() as usize);
+        } else {
+            drop(cache);
+            unsafe {
+                alloc::alloc::dealloc(self.base.as_ptr(), self.layout);
+            }
         }
     }
 }
@@ -105,11 +125,16 @@ impl TlsArea {
     /// Allocates the memory region for TLS, and initializes it.
     pub fn alloc() -> Self {
         let layout = Layout::from_size_align(tls_area_size(), TLS_ALIGN).unwrap();
-        let area_base = unsafe { alloc::alloc::alloc_zeroed(layout) };
+        let area_base = if let Some(ptr) = tls_cache().lock().pop() {
+            ptr as *mut u8
+        } else {
+            unsafe { alloc::alloc::alloc_zeroed(layout) }
+        };
 
         let tls_load_base = _stdata as *mut u8;
         let tls_load_size = _etbss as usize - _stdata as usize;
         unsafe {
+            core::ptr::write_bytes(area_base, 0, layout.size());
             // copy data from .tbdata section
             core::ptr::copy_nonoverlapping(
                 tls_load_base,
