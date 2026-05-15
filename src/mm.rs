@@ -47,6 +47,7 @@ const MPROTECT02_FAULT_LOG_LIMIT: usize = 64;
 const MREMAP_FAULT_LOG_LIMIT: usize = 96;
 const MAP_ALLOC_FAIL_LOG_BURST: usize = 4;
 const MAP_ALLOC_FAIL_LOG_PERIOD: usize = 64;
+const USER_FAULT_OOM_KILL_THRESHOLD_PAGES: usize = 64;
 #[cfg(target_arch = "riscv64")]
 const USER_TLS_PRE_TCB_SIZE: usize = 1888;
 #[cfg(target_arch = "loongarch64")]
@@ -135,6 +136,10 @@ fn should_log_map_alloc_failure() -> Option<usize> {
     } else {
         None
     }
+}
+
+fn user_fault_under_memory_pressure() -> bool {
+    global_allocator().available_pages() <= USER_FAULT_OOM_KILL_THRESHOLD_PAGES
 }
 
 fn env_value<'a>(env: &'a [String], key: &str) -> Option<&'a str> {
@@ -2197,6 +2202,7 @@ fn handle_page_fault(vaddr: VirtAddr, access_flags: MappingFlags, is_user: bool)
     let task_ext_ptr = unsafe { current.task_ext_ptr() };
     if !task_ext_ptr.is_null() {
         let aspace = &current.task_ext().aspace;
+        let user_access = is_user || access_flags.contains(MappingFlags::USER);
         let try_handle_fault = || {
             if aspace.is_owned_by_current() {
                 unsafe { aspace.get_mut_unchecked() }.handle_page_fault(vaddr, access_flags)
@@ -2205,7 +2211,7 @@ fn handle_page_fault(vaddr: VirtAddr, access_flags: MappingFlags, is_user: bool)
             }
         };
         let mut handled = try_handle_fault();
-        if !handled && is_user && global_allocator().available_pages() == 0 {
+        if !handled && user_access && user_fault_under_memory_pressure() {
             let reclaimed = crate::task::reclaim_runtime_memory_detail("page_fault_oom");
             if reclaimed.exited_tasks > 0
                 || reclaimed.stack_pages > 0
@@ -2225,15 +2231,19 @@ fn handle_page_fault(vaddr: VirtAddr, access_flags: MappingFlags, is_user: bool)
                 );
                 handled = try_handle_fault();
             }
-            if !handled && global_allocator().available_pages() == 0 {
+            if !handled && user_fault_under_memory_pressure() {
                 warn!(
-                    "unrecoverable user page fault under OOM: task={} pid={} exec_path={} vaddr={:#x} access={:?}; terminating task",
+                    "unrecoverable user page fault under memory pressure: task={} pid={} exec_path={} vaddr={:#x} access={:?} trap_user={} available_pages={} threshold_pages={}; terminating task",
                     current.id_name(),
                     current.task_ext().proc_id,
                     current.task_ext().exec_path(),
                     vaddr,
                     access_flags,
+                    is_user,
+                    global_allocator().available_pages(),
+                    USER_FAULT_OOM_KILL_THRESHOLD_PAGES,
                 );
+                let _ = crate::task::abort_current_competition_script(9, "page-fault-oom");
                 crate::task::exit_current_task(
                     crate::task::wait_status_signaled(SIGSEGV, true),
                     true,

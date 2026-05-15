@@ -86,6 +86,9 @@ pub fn current() -> CurrentTask {
 
 /// Forces a non-current task into the exited state and wakes any joiners.
 pub fn force_exit_task(task: &AxTaskRef, exit_code: i32) -> bool {
+    if current_may_uninit().is_some_and(|curr| curr.ptr_eq(task)) {
+        return false;
+    }
     if task.state() == TaskState::Exited {
         return false;
     }

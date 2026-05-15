@@ -877,6 +877,10 @@ fn kill_competition_script_tree_with_tag(expected_tag: Option<u64>, signum: usiz
     let mut tasks = Vec::new();
     collect_task_tree_postorder(&root, &mut tasks);
     collect_live_tasks_with_script_tag(tag, &mut tasks);
+    if let Some(curr) = axtask::current_may_uninit() {
+        let curr_tid = curr.id().as_u64();
+        tasks.retain(|task| task.id().as_u64() != curr_tid);
+    }
     for task in &tasks {
         if task.state() != axtask::TaskState::Exited {
             crate::signal::send_signal_to_task(task, signum);

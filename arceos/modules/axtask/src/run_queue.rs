@@ -465,7 +465,7 @@ impl<G: BaseGuard> CurrentRunQueueRef<'_, G> {
 
             // Reclaim older exited tasks eagerly so fork/exit-heavy workloads
             // do not pile up kernel stacks before the GC task gets scheduled.
-            let _ = collect_exited_tasks(32);
+            let _ = collect_exited_tasks(256);
 
             // Safety: it is called from `current_run_queue::<NoPreemptIrqSave>().exit_current(exit_code)`,
             // which disabled IRQs and preemption.
