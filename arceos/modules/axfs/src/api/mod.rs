@@ -25,6 +25,10 @@ pub fn current_dir() -> io::Result<String> {
     crate::root::current_dir()
 }
 
+pub fn current_uid() -> u32 {
+    crate::root::current_fs_cred().ruid
+}
+
 /// Changes the current working directory to the specified path.
 pub fn set_current_dir(path: &str) -> io::Result<()> {
     crate::root::set_current_dir(path)

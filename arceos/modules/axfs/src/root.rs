@@ -19,6 +19,24 @@ use crate::{
 def_resource! {
     pub static CURRENT_DIR_PATH: ResArc<Mutex<String>> = ResArc::new();
     pub static CURRENT_DIR: ResArc<Mutex<VfsNodeRef>> = ResArc::new();
+    pub static CURRENT_FS_CRED: ResArc<Mutex<FsCred>> = ResArc::new();
+}
+
+
+pub const MAX_SUPPLEMENTARY_GROUPS: usize = 32;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FsCred {
+    pub ruid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub fsuid: u32,
+    pub rgid: u32,
+    pub egid: u32,
+    pub sgid: u32,
+    pub fsgid: u32,
+    pub supplementary_len: usize,
+    pub supplementary: [u32; MAX_SUPPLEMENTARY_GROUPS],
 }
 
 impl CURRENT_DIR_PATH {
@@ -32,6 +50,12 @@ impl CURRENT_DIR {
     /// Return a copy of the CURRENT_DIR_NODE.
     pub fn copy_inner(&self) -> Mutex<VfsNodeRef> {
         Mutex::new(self.lock().clone())
+    }
+}
+
+impl CURRENT_FS_CRED {
+    pub fn copy_inner(&self) -> Mutex<FsCred> {
+        Mutex::new(*self.lock())
     }
 }
 
@@ -210,6 +234,14 @@ pub(crate) fn init_rootfs(disk: crate::dev::Disk) {
     CURRENT_DIR.init_new(Mutex::new(ROOT_DIR.clone()));
     info!("test");
     CURRENT_DIR_PATH.init_new(Mutex::new("/".into()));
+    CURRENT_FS_CRED.init_new(Mutex::new(FsCred::default()));
+}
+
+pub(crate) fn current_fs_cred() -> FsCred {
+    if !CURRENT_FS_CRED.is_inited() {
+        return FsCred::default();
+    }
+    *CURRENT_FS_CRED.lock()
 }
 
 fn parent_node_of(dir: Option<&VfsNodeRef>, path: &str) -> VfsNodeRef {
