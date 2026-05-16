@@ -26,7 +26,7 @@ use smoltcp::wire::{
 use self::listen_table::ListenTable;
 
 pub use self::dns::dns_query;
-pub use self::tcp::TcpSocket;
+pub use self::tcp::{Shutdown, TcpSocket};
 pub use self::udp::UdpSocket;
 
 macro_rules! env_or_default {

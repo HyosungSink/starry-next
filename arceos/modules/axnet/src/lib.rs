@@ -31,7 +31,7 @@ cfg_if::cfg_if! {
 }
 
 pub use self::net_impl::UdpSocket;
-pub use self::net_impl::TcpSocket;
+pub use self::net_impl::{Shutdown, TcpSocket};
 pub use self::net_impl::{bench_receive, bench_transmit};
 pub use self::net_impl::{dns_query, poll_interfaces};
 
