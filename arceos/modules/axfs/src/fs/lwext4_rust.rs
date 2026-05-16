@@ -35,7 +35,7 @@ impl Ext4FileSystem {
             disk.position()
         );
         let inner =
-            Ext4BlockWrapper::<Disk>::new(disk).expect("failed to initialize EXT4 filesystem");
+            Ext4BlockWrapper::<Disk>::new(disk, "/", "ext4_fs").expect("failed to initialize EXT4 filesystem");
         let root = Arc::new(FileWrapper::new("/", InodeTypes::EXT4_DE_DIR));
         Self { inner, root }
     }

@@ -6,6 +6,7 @@ pub struct Ext4File {
     //file_desc_map: BTreeMap<CString, ext4_file>,
     file_desc: ext4_file,
     file_path: CString,
+    open_flags: Option<u32>,
 
     this_type: InodeTypes,
 }
@@ -21,6 +22,7 @@ impl Ext4File {
                 fpos: 0,
             },
             file_path: CString::new(path).expect("CString::new Ext4File path failed"),
+            open_flags: None,
             this_type: types,
         }
     }
@@ -49,6 +51,7 @@ impl Ext4File {
     /// |   a+ or ab+ or a+b        O_RDWR|O_CREAT|O_APPEND             |
     /// |---------------------------------------------------------------|
     pub fn file_open(&mut self, path: &str, flags: u32) -> Result<usize, i32> {
+        let open_flags = flags;
         let c_path = CString::new(path).expect("CString::new failed");
         if c_path != self.get_path() {
             debug!(
@@ -59,31 +62,79 @@ impl Ext4File {
         }
         //let to_map = c_path.clone();
         let c_path = c_path.into_raw();
-        let flags = Self::flags_to_cstring(flags);
-        let flags = flags.into_raw();
-
-        let r = unsafe { ext4_fopen(&mut self.file_desc, c_path, flags) };
+        let r = unsafe { ext4_fopen2(&mut self.file_desc, c_path, open_flags as i32) };
         unsafe {
             // deallocate the CString
             drop(CString::from_raw(c_path));
-            drop(CString::from_raw(flags));
         }
         if r != EOK as i32 {
             error!("ext4_fopen: {}, rc = {}", path, r);
             return Err(r);
         }
+        self.open_flags = Some(open_flags);
         //self.file_desc_map.insert(to_map, fd); // store c_path
         debug!("file_open {}, mp={:#x}", path, self.file_desc.mp as usize);
         Ok(EOK as usize)
     }
 
+    pub fn is_open(&self) -> bool {
+        self.file_desc.mp != core::ptr::null_mut()
+    }
+
+    pub fn open_flags(&self) -> Option<u32> {
+        self.open_flags
+    }
+
+    pub fn ensure_open(&mut self, path: &str, flags: u32) -> Result<usize, i32> {
+        if self.is_open() {
+            if self.open_flags() == Some(flags) {
+                return Ok(EOK as usize);
+            }
+            self.file_close()?;
+        }
+        self.file_open(path, flags)
+    }
+
+    pub fn ensure_open_for_read(&mut self, path: &str) -> Result<usize, i32> {
+        if self.is_open() {
+            match self.open_flags() {
+                Some(O_RDONLY) | Some(O_RDWR) => return Ok(EOK as usize),
+                _ => {
+                    self.file_close()?;
+                }
+            }
+        }
+        self.file_open(path, O_RDONLY)
+    }
+
+    pub fn ensure_open_for_write(&mut self, path: &str) -> Result<usize, i32> {
+        if self.is_open() {
+            match self.open_flags() {
+                Some(O_WRONLY) | Some(O_RDWR) | Some(0x241) | Some(0x441) | Some(0x242)
+                | Some(0x442) => return Ok(EOK as usize),
+                _ => {
+                    self.file_close()?;
+                }
+            }
+        }
+        self.file_open(path, O_RDWR)
+    }
+
     pub fn file_close(&mut self) -> Result<usize, i32> {
         if self.file_desc.mp != core::ptr::null_mut() {
             debug!("file_close {:?}", self.get_path());
-            // self.file_cache_flush()?;
+            let _ = self.file_cache_flush();
             unsafe {
                 ext4_fclose(&mut self.file_desc);
             }
+            self.file_desc = ext4_file {
+                mp: core::ptr::null_mut(),
+                inode: 0,
+                flags: 0,
+                fsize: 0,
+                fpos: 0,
+            };
+            self.open_flags = None;
         }
         Ok(0)
     }
@@ -170,20 +221,44 @@ impl Ext4File {
     }
 
     pub fn file_seek(&mut self, offset: i64, seek_type: u32) -> Result<usize, i32> {
-        let mut offset = offset;
-        let size = self.file_size() as i64;
-
-        if offset > size {
-            warn!("Seek beyond the end of the file");
-            offset = size;
+        let mut r = unsafe { ext4_fseek(&mut self.file_desc, offset, seek_type) };
+        if r != EOK as i32
+            && seek_type == SEEK_SET
+            && offset >= 0
+            && self.this_type == InodeTypes::EXT4_DE_REG_FILE
+            && matches!(
+                self.open_flags,
+                Some(O_WRONLY) | Some(O_RDWR) | Some(0x241) | Some(0x441) | Some(0x242)
+                    | Some(0x442)
+            )
+            && self.file_desc.fsize < offset as u64
+        {
+            self.file_desc.fpos = offset as u64;
+            return Ok(offset as usize);
         }
-
-        let r = unsafe { ext4_fseek(&mut self.file_desc, offset, seek_type) };
         if r != EOK as i32 {
-            error!("ext4_fseek: rc = {}", r);
+            error!(
+                "ext4_fseek: path={} offset={} whence={} size={} rc={}",
+                self.file_path.to_str().unwrap_or("<invalid>"),
+                offset,
+                seek_type,
+                self.file_desc.fsize,
+                r
+            );
             return Err(r);
         }
         Ok(EOK as usize)
+    }
+
+    pub fn file_pos(&self) -> u64 {
+        self.file_desc.fpos
+    }
+
+    pub fn file_seek_if_needed(&mut self, offset: u64) -> Result<usize, i32> {
+        if self.file_desc.fpos == offset {
+            return Ok(EOK as usize);
+        }
+        self.file_seek(offset as i64, SEEK_SET)
     }
 
     pub fn file_read(&mut self, buff: &mut [u8]) -> Result<usize, i32> {
@@ -223,6 +298,7 @@ impl Ext4File {
     */
 
     pub fn file_write(&mut self, buf: &[u8]) -> Result<usize, i32> {
+        let start_pos = self.file_desc.fpos;
         let mut rw_count = 0;
         let r = unsafe {
             ext4_fwrite(
@@ -237,6 +313,11 @@ impl Ext4File {
             error!("ext4_fwrite: rc = {}", r);
             return Err(r);
         }
+        let end_pos = start_pos.saturating_add(rw_count as u64);
+        self.file_desc.fpos = end_pos;
+        if end_pos > self.file_desc.fsize {
+            self.file_desc.fsize = end_pos;
+        }
         debug!("file_write {:?}, len={}", self.get_path(), rw_count);
         Ok(rw_count)
     }
@@ -247,6 +328,10 @@ impl Ext4File {
         if r != EOK as i32 {
             error!("ext4_ftruncate: rc = {}", r);
             return Err(r);
+        }
+        self.file_desc.fsize = size;
+        if self.file_desc.fpos > size {
+            self.file_desc.fpos = size;
         }
         Ok(EOK as usize)
     }
@@ -280,7 +365,9 @@ impl Ext4File {
             drop(CString::from_raw(c_path));
         }
         if r != EOK as i32 {
-            error!("ext4_mode_get: rc = {}", r);
+            if r != ENOENT as i32 {
+                error!("ext4_mode_get: rc = {}", r);
+            }
             return Err(r);
         }
         debug!("Got file mode={:#x}", mode);
@@ -305,12 +392,7 @@ impl Ext4File {
 
     pub fn file_type_get(&mut self) -> InodeTypes {
         let mode = self.file_mode_get().unwrap();
-        // 0o777 (octal) == rwxrwxrwx
-        // if filetype == EXT4_DE_SYMLINK;
-        // mode = 0777;
-        // mode |= EXT4_INODE_MODE_SOFTLINK;
-        let cal: u32 = 0o777;
-        let types = mode & (!cal);
+        let types = mode & InodeTypes::EXT4_INODE_MODE_TYPE_MASK as u32;
         let itypes = match types {
             0x1000 => InodeTypes::EXT4_INODE_MODE_FIFO,
             0x2000 => InodeTypes::EXT4_INODE_MODE_CHARDEV,

@@ -5,9 +5,25 @@ use core::ffi::{c_char, c_void};
 use core::ptr::null_mut;
 use core::slice::{from_raw_parts, from_raw_parts_mut};
 use core::str;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// Device block size.
 const EXT4_DEV_BSIZE: u32 = 512;
+const REPEATED_ERROR_LOG_BURST: usize = 3;
+const REPEATED_ERROR_LOG_PERIOD: usize = 16;
+
+static DEV_OPEN_SEEK_FAIL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static EXT4_DEVICE_REGISTER_FAIL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+static EXT4_MOUNT_FAIL_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn sampled_log_slot(counter: &AtomicUsize) -> Option<usize> {
+    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= REPEATED_ERROR_LOG_BURST || count % REPEATED_ERROR_LOG_PERIOD == 0 {
+        Some(count)
+    } else {
+        None
+    }
+}
 
 pub trait KernelDevOp {
     //type DevType: ForeignOwnable + Sized + Send + Sync = ();
@@ -25,13 +41,15 @@ pub trait KernelDevOp {
 pub struct Ext4BlockWrapper<K: KernelDevOp> {
     value: Box<ext4_blockdev>,
     //block_dev: K::DevType,
-    name: [u8; 16],
-    mount_point: [u8; 32],
+    name: CString,
+    mount_point: CString,
+    registered: bool,
+    mounted: bool,
     pd: core::marker::PhantomData<K>,
 }
 
 impl<K: KernelDevOp> Ext4BlockWrapper<K> {
-    pub fn new(block_dev: K::DevType) -> Result<Self, i32> {
+    pub fn new(block_dev: K::DevType, mount_point: &str, device_name: &str) -> Result<Self, i32> {
         // note this ownership
         let devt_user = Box::into_raw(Box::new(block_dev)) as *mut c_void;
         //let devt_user = devt.as_mut() as *mut _ as *mut c_void;
@@ -70,40 +88,36 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
             journal: null_mut(),
         };
 
-        let c_name = CString::new("ext4_fs").expect("CString::new ext4_fs failed");
-        let c_name = c_name.as_bytes_with_nul(); // + '\0'
-                                                 //let c_mountpoint = CString::new("/mp/").unwrap();
-        let c_mountpoint = CString::new("/").unwrap();
-        let c_mountpoint = c_mountpoint.as_bytes_with_nul();
-
-        let mut name: [u8; 16] = [0; 16];
-        let mut mount_point: [u8; 32] = [0; 32];
-        name[..c_name.len()].copy_from_slice(c_name);
-        mount_point[..c_mountpoint.len()].copy_from_slice(c_mountpoint);
+        let name = CString::new(device_name).expect("CString::new ext4_fs failed");
+        let mount_point = CString::new(mount_point).expect("CString::new ext4 mountpoint failed");
 
         let mut ext4bd = Self {
             value: Box::new(ext4dev),
             //block_dev,
             name,
             mount_point,
+            registered: false,
+            mounted: false,
             pd: core::marker::PhantomData,
         };
 
         info!("New an Ext4 Block Device");
-        ext4bd.ext4_set_debug();
+        if cfg!(debug_assertions) {
+            ext4bd.ext4_set_debug();
+        }
 
         // ext4_blockdev into static instance
         // lwext4_mount
         // let c_mountpoint = c_mountpoint as *const _ as *const c_char;
-        unsafe {
-            ext4bd
-                .lwext4_mount()
-                .expect("Failed to mount the ext4 file system, perhaps the disk is not an EXT4 file system.");
+        if let Err(err) = unsafe { ext4bd.lwext4_mount() } {
+            return Err(err);
         }
 
-        ext4bd.lwext4_dir_ls();
-        ext4bd.print_lwext4_mp_stats();
-        ext4bd.print_lwext4_block_stats();
+        if cfg!(debug_assertions) {
+            ext4bd.lwext4_dir_ls();
+            ext4bd.print_lwext4_mp_stats();
+            ext4bd.print_lwext4_block_stats();
+        }
 
         Ok(ext4bd)
     }
@@ -125,7 +139,9 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         let cur = match seek_off {
             Ok(v) => v,
             Err(e) => {
-                error!("dev_open to K::seek failed: {:?}", e);
+                if let Some(count) = sampled_log_slot(&DEV_OPEN_SEEK_FAIL_LOG_COUNT) {
+                    error!("dev_open to K::seek failed: {:?} [sampled count={}]", e, count);
+                }
                 return EFAULT as _;
             }
         };
@@ -216,39 +232,43 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
     }
 
     pub unsafe fn lwext4_mount(&mut self) -> Result<usize, i32> {
-        let c_name = &self.name as *const _ as *const c_char;
-        let c_mountpoint = &self.mount_point as *const _ as *const c_char;
+        let c_name = self.name.as_ptr();
+        let c_mountpoint = self.mount_point.as_ptr();
 
         let r = ext4_device_register(self.value.as_mut(), c_name);
         if r != EOK as i32 {
-            error!("ext4_device_register: rc = {:?}\n", r);
+            if let Some(count) = sampled_log_slot(&EXT4_DEVICE_REGISTER_FAIL_LOG_COUNT) {
+                error!("ext4_device_register: rc = {:?} [sampled count={}]\n", r, count);
+            }
             return Err(r);
         }
+        self.registered = true;
         let r = ext4_mount(c_name, c_mountpoint, false);
         if r != EOK as i32 {
-            error!("ext4_mount: rc = {:?}\n", r);
+            if let Some(count) = sampled_log_slot(&EXT4_MOUNT_FAIL_LOG_COUNT) {
+                error!("ext4_mount: rc = {:?} [sampled count={}]\n", r, count);
+            }
+            let unregister = ext4_device_unregister(c_name);
+            if unregister != EOK as i32 {
+                error!("ext4_device_unregister after mount failure: rc = {:?}\n", unregister);
+            } else {
+                self.registered = false;
+            }
             return Err(r);
         }
+        self.mounted = true;
         let r = ext4_recover(c_mountpoint);
         if (r != EOK as i32) && (r != ENOTSUP as i32) {
             error!("ext4_recover: rc = {:?}\n", r);
+            let _ = self.lwext4_umount();
             return Err(r);
         }
 
-        //  ext4_mount("sda1", "/");
-        //  ext4_journal_start("/");
-        //
-        // File operations here...
-        //
-        //  ext4_journal_stop("/");
-        //  ext4_umount("/");
-        let r = ext4_journal_start(c_mountpoint);
-        if r != EOK as i32 {
-            error!("ext4_journal_start: rc = {:?}\n", r);
-            return Err(r);
-        }
+        // Keep the runtime mount on ext4's non-journaled fast path. The
+        // competition workloads rebuild the writable image per run, so the
+        // dominant cost here is per-write transaction commit overhead rather
+        // than crash recovery value.
         ext4_cache_write_back(c_mountpoint, true);
-        // ext4_bcache
 
         info!("lwext4 mount Okay");
         Ok(0)
@@ -256,17 +276,24 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
 
     /// Call this when block device is being uninstalled
     pub fn lwext4_umount(&mut self) -> Result<usize, i32> {
-        let c_name = &self.name as *const _ as *const c_char;
-        let c_mountpoint = &self.mount_point as *const _ as *const c_char;
+        if !self.mounted {
+            if self.registered {
+                unsafe {
+                    let r = ext4_device_unregister(self.name.as_ptr());
+                    if r != EOK as i32 {
+                        error!("ext4_device_unregister: fail {}", r);
+                        return Err(r);
+                    }
+                }
+                self.registered = false;
+            }
+            return Ok(0);
+        }
+        let c_name = self.name.as_ptr();
+        let c_mountpoint = self.mount_point.as_ptr();
 
         unsafe {
             ext4_cache_write_back(c_mountpoint, false);
-
-            let r = ext4_journal_stop(c_mountpoint);
-            if r != EOK as i32 {
-                error!("ext4_journal_stop: fail {}", r);
-                return Err(r);
-            }
 
             let r = ext4_umount(c_mountpoint);
             if r != EOK as i32 {
@@ -282,11 +309,13 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
         }
 
         info!("lwext4 umount Okay");
+        self.mounted = false;
+        self.registered = false;
         Ok(0)
     }
 
     pub fn lwext4_dir_ls(&self) {
-        let path = &self.mount_point;
+        let path = self.mount_point.as_ptr();
         let mut sss: [u8; 255] = [0; 255];
         let mut d: ext4_dir = unsafe { core::mem::zeroed() };
 
@@ -302,9 +331,9 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
             _ => "[???] ",
         };
 
-        info!("ls {}", str::from_utf8(path).unwrap());
+        info!("ls {}", self.mount_point.to_str().unwrap_or("<invalid>"));
         unsafe {
-            ext4_dir_open(&mut d, path as *const _ as *const c_char);
+            ext4_dir_open(&mut d, path);
             let mut de = ext4_dir_entry_next(&mut d);
             while !de.is_null() {
                 let dentry = &(*de);
@@ -379,7 +408,7 @@ impl<K: KernelDevOp> Ext4BlockWrapper<K> {
 impl<K: KernelDevOp> Drop for Ext4BlockWrapper<K> {
     fn drop(&mut self) {
         info!("Drop struct Ext4BlockWrapper");
-        self.lwext4_umount().unwrap();
+        let _ = self.lwext4_umount();
         let devtype = unsafe { Box::from_raw((*(&self.value).bdif).p_user as *mut K::DevType) };
         drop(devtype);
     }
