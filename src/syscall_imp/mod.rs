@@ -118,3 +118,83 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     info!("syscall return: {}", ans);
     ans
 }
+
+pub(crate) fn set_proc_msgmni_value(_value: usize) -> Result<(), LinuxError> {
+    Ok(())
+}
+
+pub(crate) fn set_proc_msg_next_id_value(_value: i32) -> Result<(), LinuxError> {
+    Ok(())
+}
+
+pub(crate) fn set_proc_shmmax_value(_value: usize) -> Result<(), LinuxError> {
+    Ok(())
+}
+
+pub(crate) fn set_proc_shmmni_value(_value: usize) -> Result<(), LinuxError> {
+    Ok(())
+}
+
+pub(crate) fn set_proc_shm_next_id_value(_value: i32) -> Result<(), LinuxError> {
+    Ok(())
+}
+
+pub(crate) fn proc_sysvipc_shm_contents() -> alloc::string::String {
+    alloc::string::String::new()
+}
+
+pub(crate) fn proc_sysvipc_msg_contents() -> alloc::string::String {
+    alloc::string::String::new()
+}
+
+pub(crate) fn proc_shmmax_contents() -> alloc::string::String {
+    alloc::string::String::new()
+}
+
+pub(crate) fn proc_shmmni_contents() -> alloc::string::String {
+    alloc::string::String::new()
+}
+
+pub(crate) fn proc_shm_next_id_contents() -> alloc::string::String {
+    alloc::string::String::new()
+}
+
+pub(crate) fn proc_msgmni_contents() -> alloc::string::String {
+    alloc::string::String::new()
+}
+
+pub(crate) fn proc_msg_next_id_contents() -> alloc::string::String {
+    alloc::string::String::new()
+}
+
+pub(crate) fn proc_key_users_contents() -> alloc::string::String {
+    alloc::string::String::new()
+}
+
+pub(crate) fn validate_path_components(_path: &str) -> Result<(), LinuxError> {
+    Ok(())
+}
+
+pub(crate) fn verify_searchable_prefixes(_path: &str) -> Result<(), LinuxError> {
+    Ok(())
+}
+
+pub(crate) fn handle_kernel_path(
+    _dirfd: isize,
+    path: &str,
+    _force_dir: bool,
+) -> Result<alloc::string::String, LinuxError> {
+    Ok(alloc::string::String::from(path))
+}
+
+pub(crate) fn clone_sysv_shm_process(_parent_proc_id: usize, _child_proc_id: usize) {}
+
+pub(crate) fn detach_sysv_shm_process(_proc_id: usize, _aspace: &mut axmm::AddrSpace) {}
+
+pub(crate) fn record_process_accounting(_exit_code: i32) {}
+
+pub(crate) fn clear_child_tid_and_wake(_clear_child_tid: *mut i32) {}
+
+pub(crate) fn cleanup_all_fd_tracking_for_current_process() {}
+
+pub(crate) fn wake_futex_word(_uaddr: *mut u32) {}
