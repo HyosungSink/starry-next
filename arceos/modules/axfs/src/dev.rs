@@ -1,5 +1,12 @@
 use axdriver::prelude::*;
 
+#[cfg(any(feature = "fatfs", feature = "lwext4_rs"))]
+use alloc::sync::Arc;
+#[cfg(any(feature = "fatfs", feature = "lwext4_rs"))]
+use axdriver_block::ramdisk::RamDisk;
+#[cfg(any(feature = "fatfs", feature = "lwext4_rs"))]
+use axsync::Mutex;
+
 const BLOCK_SIZE: usize = 512;
 
 /// A disk device with a cursor.
@@ -7,6 +14,16 @@ pub struct Disk {
     block_id: u64,
     offset: usize,
     dev: AxBlockDevice,
+}
+
+#[cfg(any(feature = "fatfs", feature = "lwext4_rs"))]
+pub type SharedRamDiskHandle = Arc<Mutex<RamDisk>>;
+
+#[cfg(any(feature = "fatfs", feature = "lwext4_rs"))]
+pub struct SharedRamDisk {
+    block_id: u64,
+    offset: usize,
+    dev: SharedRamDiskHandle,
 }
 
 impl Disk {
@@ -39,14 +56,12 @@ impl Disk {
     /// Read within one block, returns the number of bytes read.
     pub fn read_one(&mut self, buf: &mut [u8]) -> DevResult<usize> {
         let read_size = if self.offset == 0 && buf.len() >= BLOCK_SIZE {
-            // whole block
-            let mut data = [0u8; BLOCK_SIZE];
-            self.dev.read_block(self.block_id, &mut data)?;
-            buf[0..BLOCK_SIZE].copy_from_slice(&data);
-            // self.dev
-            //     .read_block(self.block_id, &mut buf[0..BLOCK_SIZE])?;
-            self.block_id += 1;
-            BLOCK_SIZE
+            // Fast path for aligned contiguous I/O: let the block driver
+            // transfer multiple blocks directly into the caller buffer.
+            let count = buf.len() / BLOCK_SIZE * BLOCK_SIZE;
+            self.dev.read_block(self.block_id, &mut buf[..count])?;
+            self.block_id += (count / BLOCK_SIZE) as u64;
+            count
         } else {
             // partial block
             let mut data = [0u8; BLOCK_SIZE];
@@ -69,10 +84,12 @@ impl Disk {
     /// Write within one block, returns the number of bytes written.
     pub fn write_one(&mut self, buf: &[u8]) -> DevResult<usize> {
         let write_size = if self.offset == 0 && buf.len() >= BLOCK_SIZE {
-            // whole block
-            self.dev.write_block(self.block_id, &buf[0..BLOCK_SIZE])?;
-            self.block_id += 1;
-            BLOCK_SIZE
+            // Fast path for aligned contiguous I/O: avoid per-block calls and
+            // temporary copies when the request already spans full sectors.
+            let count = buf.len() / BLOCK_SIZE * BLOCK_SIZE;
+            self.dev.write_block(self.block_id, &buf[..count])?;
+            self.block_id += (count / BLOCK_SIZE) as u64;
+            count
         } else {
             // partial block
             let mut data = [0u8; BLOCK_SIZE];
@@ -115,5 +132,79 @@ impl Disk {
         let block_id = offset / BLOCK_SIZE;
         self.dev.write_block(block_id as u64, buf).unwrap();
         Ok(buf.len())
+    }
+}
+
+#[cfg(any(feature = "fatfs", feature = "lwext4_rs"))]
+impl SharedRamDisk {
+    pub fn from_handle(dev: SharedRamDiskHandle) -> Self {
+        assert_eq!(BLOCK_SIZE, dev.lock().block_size());
+        Self {
+            block_id: 0,
+            offset: 0,
+            dev,
+        }
+    }
+
+    pub fn size(&self) -> u64 {
+        self.dev.lock().num_blocks() * BLOCK_SIZE as u64
+    }
+
+    pub fn position(&self) -> u64 {
+        self.block_id * BLOCK_SIZE as u64 + self.offset as u64
+    }
+
+    pub fn set_position(&mut self, pos: u64) {
+        self.block_id = pos / BLOCK_SIZE as u64;
+        self.offset = pos as usize % BLOCK_SIZE;
+    }
+
+    pub fn read_one(&mut self, buf: &mut [u8]) -> DevResult<usize> {
+        let read_size = if self.offset == 0 && buf.len() >= BLOCK_SIZE {
+            let count = buf.len() / BLOCK_SIZE * BLOCK_SIZE;
+            self.dev.lock().read_block(self.block_id, &mut buf[..count])?;
+            self.block_id += (count / BLOCK_SIZE) as u64;
+            count
+        } else {
+            let mut data = [0u8; BLOCK_SIZE];
+            let start = self.offset;
+            let count = buf.len().min(BLOCK_SIZE - self.offset);
+
+            self.dev.lock().read_block(self.block_id, &mut data)?;
+            buf[..count].copy_from_slice(&data[start..start + count]);
+
+            self.offset += count;
+            if self.offset >= BLOCK_SIZE {
+                self.block_id += 1;
+                self.offset -= BLOCK_SIZE;
+            }
+            count
+        };
+        Ok(read_size)
+    }
+
+    pub fn write_one(&mut self, buf: &[u8]) -> DevResult<usize> {
+        let write_size = if self.offset == 0 && buf.len() >= BLOCK_SIZE {
+            let count = buf.len() / BLOCK_SIZE * BLOCK_SIZE;
+            self.dev.lock().write_block(self.block_id, &buf[..count])?;
+            self.block_id += (count / BLOCK_SIZE) as u64;
+            count
+        } else {
+            let mut data = [0u8; BLOCK_SIZE];
+            let start = self.offset;
+            let count = buf.len().min(BLOCK_SIZE - self.offset);
+
+            self.dev.lock().read_block(self.block_id, &mut data)?;
+            data[start..start + count].copy_from_slice(&buf[..count]);
+            self.dev.lock().write_block(self.block_id, &data)?;
+
+            self.offset += count;
+            if self.offset >= BLOCK_SIZE {
+                self.block_id += 1;
+                self.offset -= BLOCK_SIZE;
+            }
+            count
+        };
+        Ok(write_size)
     }
 }
