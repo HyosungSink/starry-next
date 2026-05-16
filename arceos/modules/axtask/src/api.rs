@@ -4,7 +4,6 @@ use alloc::{
     string::String,
     sync::{Arc, Weak},
 };
-
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use kernel_guard::NoPreemptIrqSave;
@@ -15,7 +14,7 @@ static WAIT_INTERRUPT_HOOK: AtomicUsize = AtomicUsize::new(0);
 static TASK_SWITCH_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 #[doc(cfg(feature = "multitask"))]
-pub use crate::task::{CurrentTask, TaskId, TaskInner};
+pub use crate::task::{reclaim_task_stack_cache, CurrentTask, TaskId, TaskInner};
 #[doc(cfg(feature = "multitask"))]
 pub use crate::task_ext::{TaskExtMut, TaskExtRef};
 #[doc(cfg(feature = "multitask"))]
@@ -28,6 +27,10 @@ pub type AxTaskRef = Arc<AxTask>;
 pub type WeakAxTaskRef = Weak<AxTask>;
 
 pub use crate::task::TaskState;
+
+pub fn reclaim_exited_tasks(max_scan: usize) -> usize {
+    crate::run_queue::reclaim_exited_tasks(max_scan)
+}
 
 /// The wrapper type for [`cpumask::CpuMask`] with SMP configuration.
 pub type AxCpuMask = cpumask::CpuMask<{ axconfig::SMP }>;
@@ -79,6 +82,34 @@ pub fn current_may_uninit() -> Option<CurrentTask> {
 /// Panics if the current task is not initialized.
 pub fn current() -> CurrentTask {
     CurrentTask::get()
+}
+
+/// Forces a non-current task into the exited state and wakes any joiners.
+pub fn force_exit_task(task: &AxTaskRef, exit_code: i32) -> bool {
+    if task.state() == TaskState::Exited {
+        return false;
+    }
+    task.set_in_wait_queue(false);
+    task.set_state(TaskState::Exited);
+    task.notify_exit(exit_code);
+    true
+}
+
+/// Wakes a blocked task so it can observe asynchronous events such as signals.
+pub fn wake_task(task: &AxTaskRef) -> bool {
+    if task.state() == TaskState::Blocked {
+        select_run_queue::<NoPreemptIrqSave>(task).unblock_task(task.clone(), true);
+        return true;
+    }
+    #[cfg(feature = "preempt")]
+    {
+        let curr = current();
+        if !curr.ptr_eq(task) && task.state() == TaskState::Ready {
+            curr.set_preempt_pending(true);
+            return true;
+        }
+    }
+    false
 }
 
 pub fn set_wait_interrupt_hook(hook: fn() -> bool) {
@@ -179,6 +210,28 @@ where
 /// [CFS]: https://en.wikipedia.org/wiki/Completely_Fair_Scheduler
 pub fn set_priority(prio: isize) -> bool {
     current_run_queue::<NoPreemptIrqSave>().set_current_priority(prio)
+}
+
+/// Set the priority for a specific task.
+///
+/// The exact priority range depends on the active scheduler implementation.
+/// Returns `true` if the scheduler accepted the new priority.
+pub fn set_task_priority(task: &AxTaskRef, prio: isize) -> bool {
+    select_run_queue::<NoPreemptIrqSave>(task).set_task_priority(task, prio)
+}
+
+/// Set the time slice for a specific task when the RR scheduler is active.
+pub fn set_task_time_slice(task: &AxTaskRef, time_slice: usize) -> bool {
+    #[cfg(feature = "sched_rr")]
+    {
+        task.set_time_slice_value(time_slice as isize);
+        true
+    }
+    #[cfg(not(feature = "sched_rr"))]
+    {
+        let _ = (task, time_slice);
+        false
+    }
 }
 
 /// Set the affinity for the current task.
