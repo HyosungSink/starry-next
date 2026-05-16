@@ -58,4 +58,4 @@ rev = "c8a13b0"
 replace-with = "vendored-sources"
 
 [source.vendored-sources]
-directory = "vendor"
+directory = "%VENDOR_DIR%"
