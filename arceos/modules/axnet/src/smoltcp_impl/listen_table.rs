@@ -82,7 +82,7 @@ impl ListenTable {
         if let Some(entry) = self.tcp[port as usize].lock().deref() {
             Ok(entry.syn_queue.iter().any(|&handle| is_connected(handle)))
         } else {
-            ax_err!(InvalidInput, "socket accept() failed: not listen")
+            Err(AxError::InvalidInput)
         }
     }
 
@@ -106,7 +106,7 @@ impl ListenTable {
             let handle = syn_queue.swap_remove_front(idx).unwrap();
             Ok((handle, addr_tuple))
         } else {
-            ax_err!(InvalidInput, "socket accept() failed: not listen")
+            Err(AxError::InvalidInput)
         }
     }
 
@@ -141,7 +141,16 @@ impl ListenTable {
 
 fn is_connected(handle: SocketHandle) -> bool {
     SOCKET_SET.with_socket::<tcp::Socket, _, _>(handle, |socket| {
-        !matches!(socket.state(), State::Listen | State::SynReceived)
+        matches!(
+            socket.state(),
+            State::Established
+                | State::FinWait1
+                | State::FinWait2
+                | State::CloseWait
+                | State::Closing
+                | State::LastAck
+                | State::TimeWait
+        )
     })
 }
 

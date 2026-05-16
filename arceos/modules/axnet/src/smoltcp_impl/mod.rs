@@ -5,7 +5,7 @@ mod listen_table;
 mod tcp;
 mod udp;
 
-use alloc::vec;
+use alloc::{collections::VecDeque, vec, vec::Vec};
 use core::cell::RefCell;
 use core::ops::DerefMut;
 
@@ -18,7 +18,10 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{self, AnySocket};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
+use smoltcp::wire::{
+    ArpPacket, EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress,
+    IpCidr, Ipv4Address, Ipv4Packet,
+};
 
 use self::listen_table::ListenTable;
 
@@ -44,8 +47,8 @@ const STANDARD_MTU: usize = 1500;
 
 const RANDOM_SEED: u64 = 0xA2CE_05A2_CE05_A2CE;
 
-const TCP_RX_BUF_LEN: usize = 64 * 1024;
-const TCP_TX_BUF_LEN: usize = 64 * 1024;
+const TCP_RX_BUF_LEN: usize = 1024 * 1024;
+const TCP_TX_BUF_LEN: usize = 1024 * 1024;
 const UDP_RX_BUF_LEN: usize = 64 * 1024;
 const UDP_TX_BUF_LEN: usize = 64 * 1024;
 const LISTEN_QUEUE_SIZE: usize = 512;
@@ -53,11 +56,13 @@ const LISTEN_QUEUE_SIZE: usize = 512;
 static LISTEN_TABLE: LazyInit<ListenTable> = LazyInit::new();
 static SOCKET_SET: LazyInit<SocketSetWrapper> = LazyInit::new();
 static ETH0: LazyInit<InterfaceWrapper> = LazyInit::new();
+static TCP_ZOMBIES: Mutex<Vec<SocketHandle>> = Mutex::new(Vec::new());
 
 struct SocketSetWrapper<'a>(Mutex<SocketSet<'a>>);
 
 struct DeviceWrapper {
     inner: RefCell<AxNetDevice>, // use `RefCell` is enough since it's wrapped in `Mutex` in `InterfaceWrapper`.
+    loopback: RefCell<VecDeque<Vec<u8>>>,
 }
 
 struct InterfaceWrapper {
@@ -119,8 +124,18 @@ impl<'a> SocketSetWrapper<'a> {
         f(socket)
     }
 
-    pub fn poll_interfaces(&self) {
-        ETH0.poll(&self.0);
+    pub fn with_set<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce(&SocketSet<'a>) -> R,
+    {
+        let set = self.0.lock();
+        f(&set)
+    }
+
+    pub fn poll_interfaces(&self) -> bool {
+        let readiness_changed = ETH0.poll(&self.0);
+        reap_tcp_zombies();
+        readiness_changed
     }
 
     pub fn remove(&self, handle: SocketHandle) {
@@ -170,12 +185,12 @@ impl InterfaceWrapper {
         };
     }
 
-    pub fn poll(&self, sockets: &Mutex<SocketSet>) {
+    pub fn poll(&self, sockets: &Mutex<SocketSet>) -> bool {
         let mut dev = self.dev.lock();
         let mut iface = self.iface.lock();
         let mut sockets = sockets.lock();
         let timestamp = Self::current_time();
-        iface.poll(timestamp, dev.deref_mut(), &mut sockets);
+        iface.poll(timestamp, dev.deref_mut(), &mut sockets)
     }
 }
 
@@ -183,6 +198,7 @@ impl DeviceWrapper {
     fn new(inner: AxNetDevice) -> Self {
         Self {
             inner: RefCell::new(inner),
+            loopback: RefCell::new(VecDeque::new()),
         }
     }
 }
@@ -198,6 +214,13 @@ impl Device for DeviceWrapper {
         Self: 'a;
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        if let Some(frame) = self.loopback.borrow_mut().pop_front() {
+            return Some((
+                AxNetRxToken(self, AxNetRxBuf::Loopback(frame)),
+                AxNetTxToken(self),
+            ));
+        }
+
         let mut dev = self.inner.borrow_mut();
         if let Err(e) = dev.recycle_tx_buffers() {
             warn!("recycle_tx_buffers failed: {:?}", e);
@@ -216,7 +239,10 @@ impl Device for DeviceWrapper {
                 return None;
             }
         };
-        Some((AxNetRxToken(&self.inner, rx_buf), AxNetTxToken(&self.inner)))
+        Some((
+            AxNetRxToken(self, AxNetRxBuf::Device(rx_buf)),
+            AxNetTxToken(self),
+        ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
@@ -226,7 +252,7 @@ impl Device for DeviceWrapper {
             return None;
         }
         if dev.can_transmit() {
-            Some(AxNetTxToken(&self.inner))
+            Some(AxNetTxToken(self))
         } else {
             None
         }
@@ -241,27 +267,43 @@ impl Device for DeviceWrapper {
     }
 }
 
-struct AxNetRxToken<'a>(&'a RefCell<AxNetDevice>, NetBufPtr);
-struct AxNetTxToken<'a>(&'a RefCell<AxNetDevice>);
+enum AxNetRxBuf {
+    Device(NetBufPtr),
+    Loopback(Vec<u8>),
+}
+
+struct AxNetRxToken<'a>(&'a DeviceWrapper, AxNetRxBuf);
+struct AxNetTxToken<'a>(&'a DeviceWrapper);
 
 impl RxToken for AxNetRxToken<'_> {
     fn preprocess(&self, sockets: &mut SocketSet<'_>) {
-        snoop_tcp_packet(self.1.packet(), sockets).ok();
+        let packet = match &self.1 {
+            AxNetRxBuf::Device(buf) => buf.packet(),
+            AxNetRxBuf::Loopback(buf) => buf.as_slice(),
+        };
+        snoop_tcp_packet(packet, sockets).ok();
     }
 
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut rx_buf = self.1;
-        trace!(
-            "RECV {} bytes: {:02X?}",
-            rx_buf.packet_len(),
-            rx_buf.packet()
-        );
-        let result = f(rx_buf.packet_mut());
-        self.0.borrow_mut().recycle_rx_buffer(rx_buf).unwrap();
-        result
+        match self.1 {
+            AxNetRxBuf::Device(mut rx_buf) => {
+                trace!(
+                    "RECV {} bytes: {:02X?}",
+                    rx_buf.packet_len(),
+                    rx_buf.packet()
+                );
+                let result = f(rx_buf.packet_mut());
+                self.0.inner.borrow_mut().recycle_rx_buffer(rx_buf).unwrap();
+                result
+            }
+            AxNetRxBuf::Loopback(mut buf) => {
+                trace!("RECV loopback {} bytes: {:02X?}", buf.len(), buf);
+                f(buf.as_mut_slice())
+            }
+        }
     }
 }
 
@@ -270,12 +312,42 @@ impl TxToken for AxNetTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut dev = self.0.borrow_mut();
-        let mut tx_buf = dev.alloc_tx_buffer(len).unwrap();
-        let ret = f(tx_buf.packet_mut());
-        trace!("SEND {} bytes: {:02X?}", len, tx_buf.packet());
-        dev.transmit(tx_buf).unwrap();
+        let mut packet = vec![0u8; len];
+        let ret = f(packet.as_mut_slice());
+        trace!("SEND {} bytes: {:02X?}", len, packet);
+        if is_loopback_frame(&packet) {
+            self.0.loopback.borrow_mut().push_back(packet);
+            return ret;
+        }
+        let mut tx_buf = self.0.inner.borrow_mut().alloc_tx_buffer(len).unwrap();
+        tx_buf.packet_mut().copy_from_slice(&packet);
+        self.0.inner.borrow_mut().transmit(tx_buf).unwrap();
         ret
+    }
+}
+
+fn local_ipv4() -> Option<Ipv4Address> {
+    IP.parse().ok()
+}
+
+fn is_loopback_frame(buf: &[u8]) -> bool {
+    let Ok(frame) = EthernetFrame::new_checked(buf) else {
+        return false;
+    };
+    match frame.ethertype() {
+        EthernetProtocol::Ipv4 => {
+            let Ok(packet) = Ipv4Packet::new_checked(frame.payload()) else {
+                return false;
+            };
+            local_ipv4().is_some_and(|ip| packet.dst_addr() == ip)
+        }
+        EthernetProtocol::Arp => {
+            let Ok(packet) = ArpPacket::new_checked(frame.payload()) else {
+                return false;
+            };
+            local_ipv4().is_some_and(|ip| packet.target_protocol_addr() == ip.as_bytes())
+        }
+        _ => false,
     }
 }
 
@@ -302,8 +374,35 @@ fn snoop_tcp_packet(buf: &[u8], sockets: &mut SocketSet<'_>) -> Result<(), smolt
 ///
 /// It may receive packets from the NIC and process them, and transmit queued
 /// packets to the NIC.
-pub fn poll_interfaces() {
-    SOCKET_SET.poll_interfaces();
+pub fn poll_interfaces() -> bool {
+    SOCKET_SET.poll_interfaces()
+}
+
+pub(super) fn queue_tcp_zombie(handle: SocketHandle) {
+    let mut zombies = TCP_ZOMBIES.lock();
+    if !zombies.contains(&handle) {
+        zombies.push(handle);
+    }
+}
+
+fn reap_tcp_zombies() {
+    let mut zombies = TCP_ZOMBIES.lock();
+    let mut i = 0;
+    while i < zombies.len() {
+        let handle = zombies[i];
+        let should_remove = SOCKET_SET.with_set(|set| {
+            set.iter()
+                .find(|(candidate, _)| *candidate == handle)
+                .and_then(|(_, socket)| socket::tcp::Socket::downcast(socket))
+                .is_none_or(|socket| !socket.is_open())
+        });
+        if should_remove {
+            SOCKET_SET.remove(handle);
+            zombies.swap_remove(i);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Benchmark raw socket transmit bandwidth.

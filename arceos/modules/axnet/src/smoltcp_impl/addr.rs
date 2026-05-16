@@ -1,8 +1,17 @@
 use core::net::{IpAddr, Ipv4Addr, SocketAddr};
 use smoltcp::wire::{IpAddress, IpEndpoint, Ipv4Address};
 
-pub const fn from_core_ipaddr(ip: IpAddr) -> IpAddress {
+fn normalize_ipaddr(ip: IpAddr) -> IpAddr {
     match ip {
+        IpAddr::V4(v4) if v4.is_loopback() => {
+            super::IP.parse::<IpAddr>().ok().unwrap_or(IpAddr::V4(v4))
+        }
+        _ => ip,
+    }
+}
+
+pub fn from_core_ipaddr(ip: IpAddr) -> IpAddress {
+    match normalize_ipaddr(ip) {
         IpAddr::V4(ipv4) => IpAddress::Ipv4(Ipv4Address(ipv4.octets())),
         _ => panic!("IPv6 not supported"),
     }
@@ -16,7 +25,7 @@ pub const fn into_core_ipaddr(ip: IpAddress) -> IpAddr {
     }
 }
 
-pub const fn from_core_sockaddr(addr: SocketAddr) -> IpEndpoint {
+pub fn from_core_sockaddr(addr: SocketAddr) -> IpEndpoint {
     IpEndpoint {
         addr: from_core_ipaddr(addr.ip()),
         port: addr.port(),
