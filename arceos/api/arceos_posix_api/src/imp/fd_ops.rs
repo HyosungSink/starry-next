@@ -11,6 +11,7 @@ use crate::ctypes;
 use crate::imp::stdio::{stdin, stdout};
 
 pub const AX_FILE_LIMIT: usize = 1024;
+pub(crate) const FD_CLOEXEC_FLAG: usize = 1;
 
 #[allow(dead_code)]
 pub trait FileLike: Send + Sync {
@@ -20,6 +21,12 @@ pub trait FileLike: Send + Sync {
     fn into_any(self: Arc<Self>) -> Arc<dyn core::any::Any + Send + Sync>;
     fn poll(&self) -> LinuxResult<PollState>;
     fn set_nonblocking(&self, nonblocking: bool) -> LinuxResult;
+    fn status_flags(&self) -> usize {
+        0
+    }
+    fn fcntl_identity(&self) -> usize {
+        core::ptr::from_ref(self).cast::<()>() as usize
+    }
 }
 
 def_resource! {
@@ -51,6 +58,13 @@ pub fn get_file_like(fd: c_int) -> LinuxResult<Arc<dyn FileLike>> {
 /// Add a file to the file descriptor table.
 pub fn add_file_like(f: Arc<dyn FileLike>) -> LinuxResult<c_int> {
     Ok(FD_TABLE.write().add(f).map_err(|_| LinuxError::EMFILE)? as c_int)
+}
+
+pub(crate) fn add_file_like_with_fd_flags(
+    f: Arc<dyn FileLike>,
+    _flags: usize,
+) -> LinuxResult<c_int> {
+    add_file_like(f)
 }
 
 /// Close a file by `fd`.
