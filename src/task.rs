@@ -96,7 +96,7 @@ impl TaskExt {
 
         let current_task = current();
         let mut current_aspace = current_task.task_ext().aspace.lock();
-        let new_aspace = current_aspace.clone_or_err()?;
+        let new_aspace = current_aspace.clone_or_err(false)?;
         new_task
             .ctx_mut()
             .set_page_table_root(new_aspace.page_table_root());

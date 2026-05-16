@@ -755,8 +755,7 @@ impl AddrSpace {
     /// 克隆 AddrSpace。这将创建一个新的页表，并将旧页表中的所有区域（包括内核区域）映射到新的页表中，但仅将用户区域的映射到新的 MemorySet 中。
     ///
     /// 如果发生错误，新创建的 MemorySet 将被丢弃并返回错误。
-    pub fn clone_or_err(&mut self) -> AxResult<Self> {
-        let force_deep_copy = false;
+    pub fn clone_or_err(&mut self, force_deep_copy: bool) -> AxResult<Self> {
         // 由于要克隆的这个地址空间可能是用户空间，而用户空间在一开始创建时不会在MemorySet中管理内核区域，而是直接把相关的页表项复制到了新页表中，所以在MemorySet中没有内核区域，需要另外处理。
         let mut new_pt = PageTable::try_new().map_err(|_| AxError::NoMemory)?;
         // 如果不是 ARMv8 架构，将内核部分复制到用户页表中。
