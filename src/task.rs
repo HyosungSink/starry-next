@@ -2601,7 +2601,7 @@ where
 }
 
 pub fn exec_with_args_env(path: &str, args: Vec<String>, env: Vec<String>) -> AxResult<()> {
-    exec_with_args_env_loader(path, args, env, crate::mm::load_user_app_with_env)
+    exec_with_args_env_loader(path, args, env, crate::mm::load_user_app)
 }
 
 pub fn exec_with_args_env_from_bytes(
@@ -2615,7 +2615,7 @@ pub fn exec_with_args_env_from_bytes(
         if let Some(image) = image.take() {
             crate::mm::load_user_app_from_bytes(path, image, args, env, uspace)
         } else {
-            crate::mm::load_user_app_with_env(path, args, env, uspace)
+            crate::mm::load_user_app(path, args, env, uspace)
         }
     })
 }

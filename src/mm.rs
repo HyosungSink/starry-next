@@ -2076,23 +2076,13 @@ fn load_user_app_inner_with_image(
     Ok((entry, user_sp, heap_bottom, user_tp, elf_parser.base()))
 }
 
-pub fn load_user_app_with_env(
+pub fn load_user_app(
     program_path: &str,
     args: &mut VecDeque<String>,
     env: &[String],
     uspace: &mut AddrSpace,
 ) -> AxResult<(VirtAddr, VirtAddr, VirtAddr, usize, usize)> {
     load_user_app_inner(program_path, args, env, uspace, 0)
-}
-
-pub fn load_user_app(
-    args: &mut VecDeque<String>,
-    uspace: &mut AddrSpace,
-) -> AxResult<(VirtAddr, VirtAddr)> {
-    let program_path = args.front().cloned().unwrap_or_default();
-    let env = runtime_env_for(&program_path);
-    let (entry, user_sp, _, _, _) = load_user_app_with_env(&program_path, args, &env, uspace)?;
-    Ok((entry, user_sp))
 }
 
 pub fn load_user_app_from_bytes(

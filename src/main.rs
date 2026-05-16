@@ -88,8 +88,10 @@ fn run_user_app(testcase: TestCase) {
     )
     .expect("Failed to create user address space");
 
-    match mm::load_user_app(&mut args, &mut uspace) {
-        Ok((entry_vaddr, ustack_top)) => {
+    let program_path = args.front().cloned().unwrap_or_default();
+    let env = mm::runtime_env_for(&program_path);
+    match mm::load_user_app(&program_path, &mut args, &env, &mut uspace) {
+        Ok((entry_vaddr, ustack_top, _, _, _)) => {
             let user_task = task::spawn_user_task(
                 Arc::new(Mutex::new(uspace)),
                 UspaceContext::new(entry_vaddr.into(), ustack_top, 2333),
