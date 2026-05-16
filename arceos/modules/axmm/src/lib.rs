@@ -10,19 +10,30 @@ mod aspace;
 mod backend;
 
 pub use self::aspace::AddrSpace;
-pub use self::backend::Backend;
+pub use self::backend::{Backend, SharedFrames, alloc_user_frame, dec_frame_ref};
 
 use axerrno::{AxError, AxResult};
 use axhal::mem::phys_to_virt;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use kspin::SpinNoIrq;
 use lazyinit::LazyInit;
 use memory_addr::{PhysAddr, VirtAddr, va};
 use memory_set::MappingError;
 
 static KERNEL_ASPACE: LazyInit<SpinNoIrq<AddrSpace>> = LazyInit::new();
+static BAD_STATE_MAPPING_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 fn mapping_err_to_ax_err(err: MappingError) -> AxError {
-    warn!("Mapping error: {:?}", err);
+    match err {
+        MappingError::AlreadyExists => debug!("Mapping error: {:?}", err),
+        MappingError::BadState => {
+            let count = BAD_STATE_MAPPING_LOG_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+            if count <= 4 || count % 64 == 0 {
+                warn!("Mapping error: {:?} [sampled count={}]", err, count);
+            }
+        }
+        _ => warn!("Mapping error: {:?}", err),
+    }
     match err {
         MappingError::InvalidParam => AxError::InvalidInput,
         MappingError::AlreadyExists => AxError::AlreadyExists,
