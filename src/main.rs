@@ -526,12 +526,63 @@ ltp_should_suppress_line() {{
   return 1
 }}
 
+ltp_count_value() {{
+  local value="$1"
+  case "$value" in
+    ""|*[!0-9]*)
+      echo 0
+      return
+      ;;
+  esac
+  if [ "$value" -gt 10000 ] 2>/dev/null; then
+    echo 0
+  else
+    echo "$value"
+  fi
+}}
+
+ltp_failure_count_value() {{
+  local value="$1"
+  case "$value" in
+    ""|*[!0-9]*)
+      echo 0
+      return
+      ;;
+  esac
+  if [ "$value" -gt 10000 ] 2>/dev/null; then
+    echo 1
+  else
+    echo "$value"
+  fi
+}}
+
+ltp_sanitize_count_line() {{
+  local key value
+  set -- $1
+  key="${{1:-}}"
+  value="${{2:-}}"
+  case "$key" in
+    passed|skipped|warnings)
+      printf '%s   %s\n' "$key" "$(ltp_count_value "$value")"
+      return 0
+      ;;
+    failed|broken)
+      printf '%s   %s\n' "$key" "$(ltp_failure_count_value "$value")"
+      return 0
+      ;;
+  esac
+  return 1
+}}
+
 ltp_emit_log_file() {{
   local log_file_path="$1"
   local line prev_line repeat_count=0 has_prev=0
   while IFS= read -r line || [ -n "$line" ]; do
     if ltp_should_suppress_line "$line"; then
       continue
+    fi
+    if sanitized_line="$(ltp_sanitize_count_line "$line")"; then
+      line="$sanitized_line"
     fi
     if [ "$has_prev" -eq 1 ] && [ "$line" = "$prev_line" ]; then
       repeat_count=$((repeat_count + 1))
@@ -587,19 +638,19 @@ run_ltp_case() {{
       failed*)
         if [ "$in_summary" -eq 1 ]; then
           set -- $line
-          failed=${{2:-0}}
+          failed=$(ltp_failure_count_value "${{2:-0}}")
         fi
         ;;
       broken*)
         if [ "$in_summary" -eq 1 ]; then
           set -- $line
-          broken=${{2:-0}}
+          broken=$(ltp_failure_count_value "${{2:-0}}")
         fi
         ;;
       skipped*)
         if [ "$in_summary" -eq 1 ]; then
           set -- $line
-          skipped=${{2:-0}}
+          skipped=$(ltp_count_value "${{2:-0}}")
         fi
         ;;
     esac
