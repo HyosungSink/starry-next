@@ -13,6 +13,7 @@ mod diag;
 mod mm;
 mod syscall_imp;
 mod task;
+mod usercopy;
 use alloc::{
     collections::VecDeque,
     string::{String, ToString},
