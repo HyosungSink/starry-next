@@ -125,7 +125,7 @@ extern "C" {
 
 /**@brief   Cache size of block device.*/
 #ifndef CONFIG_BLOCK_DEV_CACHE_SIZE
-#define CONFIG_BLOCK_DEV_CACHE_SIZE 8
+#define CONFIG_BLOCK_DEV_CACHE_SIZE 512
 #endif
 
 
@@ -137,7 +137,7 @@ extern "C" {
 
 /**@brief   Maximum block device count*/
 #ifndef CONFIG_EXT4_BLOCKDEVS_COUNT
-#define CONFIG_EXT4_BLOCKDEVS_COUNT 2
+#define CONFIG_EXT4_BLOCKDEVS_COUNT 16
 #endif
 
 /**@brief   Maximum mountpoint name*/
@@ -147,7 +147,7 @@ extern "C" {
 
 /**@brief   Maximum mountpoint count*/
 #ifndef CONFIG_EXT4_MOUNTPOINTS_COUNT
-#define CONFIG_EXT4_MOUNTPOINTS_COUNT 2
+#define CONFIG_EXT4_MOUNTPOINTS_COUNT 16
 #endif
 
 /**@brief   Include open flags from ext4_errno or standard library.*/

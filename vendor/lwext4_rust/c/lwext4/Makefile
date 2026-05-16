@@ -1,4 +1,6 @@
 
+SHELL := /bin/bash
+
 #Release
 #Debug
 BUILD_TYPE = Release
@@ -25,7 +27,8 @@ COMMON_DEFINITIONS =                                      \
 define generate_common
 	rm -R -f build_$(1)
 	mkdir build_$(1)
-	cd build_$(1) && cmake -G"Unix Makefiles"           \
+	cd build_$(1) && ARCH=$(ARCH) cmake -G"Unix Makefiles"           \
+	-DCMAKE_C_COMPILER_WORKS=TRUE -DCMAKE_CXX_COMPILER_WORKS=TRUE \
 	$(COMMON_DEFINITIONS)                               \
 	$(2)                                                \
 	-DCMAKE_TOOLCHAIN_FILE=../toolchain/$(1).cmake ..
@@ -35,7 +38,7 @@ ARCH ?= x86_64
 #Output: src/liblwext4.a
 musl-generic:
 	$(call generate_common,$@)
-	cd build_$@ && make lwext4
+	cd build_$@ && env -u MAKEFLAGS -u MFLAGS $(MAKE) -j1 SHELL=/bin/bash lwext4
 	cp build_$@/src/liblwext4.a ./liblwext4-$(ARCH).a
 
 generic:

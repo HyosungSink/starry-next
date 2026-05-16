@@ -474,16 +474,26 @@ Finish:
 
 static struct ext4_mountpoint *ext4_get_mount(const char *path)
 {
+	struct ext4_mountpoint *best = NULL;
+	size_t best_len = 0;
+
 	for (size_t i = 0; i < CONFIG_EXT4_MOUNTPOINTS_COUNT; ++i) {
+		size_t mount_len;
 
 		if (!s_mp[i].mounted)
 			continue;
 
-		if (!strncmp(s_mp[i].name, path, strlen(s_mp[i].name)))
-			return &s_mp[i];
+		mount_len = strlen(s_mp[i].name);
+		if (strncmp(s_mp[i].name, path, mount_len))
+			continue;
+
+		if (mount_len > best_len) {
+			best = &s_mp[i];
+			best_len = mount_len;
+		}
 	}
 
-	return NULL;
+	return best;
 }
 
 __unused
@@ -1436,6 +1446,51 @@ int ext4_cache_flush(const char *path)
 	return ret;
 }
 
+static int ext4_fread_partial_cached(struct ext4_blockdev *bdev,
+				     ext4_fsblk_t fblk,
+				     uint32_t block_off,
+				     uint8_t *buf,
+				     size_t len)
+{
+	struct ext4_block block;
+	int r;
+
+	r = ext4_trans_block_get(bdev, &block, fblk);
+	if (r != EOK)
+		return r;
+
+	memcpy(buf, block.data + block_off, len);
+	return ext4_block_set(bdev, &block);
+}
+
+static int ext4_fwrite_partial_cached(struct ext4_blockdev *bdev,
+				      ext4_fsblk_t fblk,
+				      uint32_t block_size,
+				      uint32_t block_off,
+				      const uint8_t *buf,
+				      size_t len,
+				      bool zero_fill)
+{
+	struct ext4_block block;
+	int r;
+
+	if (zero_fill) {
+		r = ext4_trans_block_get_noread(bdev, &block, fblk);
+		if (r != EOK)
+			return r;
+		memset(block.data, 0, block_size);
+		ext4_bcache_set_flag(block.buf, BC_UPTODATE);
+	} else {
+		r = ext4_trans_block_get(bdev, &block, fblk);
+		if (r != EOK)
+			return r;
+	}
+
+	memcpy(block.data + block_off, buf, len);
+	ext4_trans_set_block_dirty(block.buf);
+	return ext4_block_set(bdev, &block);
+}
+
 int ext4_fremove(const char *path)
 {
 	ext4_file f;
@@ -1749,8 +1804,8 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 
 		/* Do we get an unwritten range? */
 		if (fblock != 0) {
-			uint64_t off = fblock * block_size + unalg;
-			r = ext4_block_readbytes(file->mp->fs.bdev, off, u8_buf, len);
+			r = ext4_fread_partial_cached(file->mp->fs.bdev, fblock, unalg,
+						      u8_buf, len);
 			if (r != EOK)
 				goto Finish;
 
@@ -1806,13 +1861,17 @@ int ext4_fread(ext4_file *file, void *buf, size_t size, size_t *rcnt)
 	}
 
 	if (size) {
-		uint64_t off;
 		r = ext4_fs_get_inode_dblk_idx(&ref, iblock_idx, &fblock, true);
 		if (r != EOK)
 			goto Finish;
 
-		off = fblock * block_size;
-		r = ext4_block_readbytes(file->mp->fs.bdev, off, u8_buf, size);
+		if (fblock != 0) {
+			r = ext4_fread_partial_cached(file->mp->fs.bdev, fblock, 0,
+						      u8_buf, size);
+		} else {
+			memset(u8_buf, 0, size);
+			r = EOK;
+		}
 		if (r != EOK)
 			goto Finish;
 
@@ -1883,7 +1942,6 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 
 	if (unalg) {
 		size_t len =  size;
-		uint64_t off;
 		if (size > (block_size - unalg))
 			len = block_size - unalg;
 
@@ -1891,8 +1949,8 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 		if (r != EOK)
 			goto Finish;
 
-		off = fblk * block_size + unalg;
-		r = ext4_block_writebytes(file->mp->fs.bdev, off, u8_buf, len);
+		r = ext4_fwrite_partial_cached(file->mp->fs.bdev, fblk, block_size,
+					       unalg, u8_buf, len, false);
 		if (r != EOK)
 			goto Finish;
 
@@ -1975,7 +2033,7 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 		goto Finish;
 
 	if (size) {
-		uint64_t off;
+		bool zero_fill = false;
 		if (iblk_idx < ifile_blocks) {
 			r = ext4_fs_init_inode_dblk_idx(&ref, iblk_idx, &fblk);
 			if (r != EOK)
@@ -1985,10 +2043,11 @@ int ext4_fwrite(ext4_file *file, const void *buf, size_t size, size_t *wcnt)
 			if (r != EOK)
 				/*Node size sholud be updated.*/
 				goto out_fsize;
+			zero_fill = true;
 		}
 
-		off = fblk * block_size;
-		r = ext4_block_writebytes(file->mp->fs.bdev, off, u8_buf, size);
+		r = ext4_fwrite_partial_cached(file->mp->fs.bdev, fblk, block_size,
+					       0, u8_buf, size, zero_fill);
 		if (r != EOK)
 			goto Finish;
 
@@ -2548,7 +2607,7 @@ int ext4_readlink(const char *path, char *buf, size_t bufsize, size_t *rcnt)
 	struct ext4_mountpoint *mp = ext4_get_mount(path);
 	int r;
 	ext4_file f;
-	int filetype;
+	struct ext4_inode_ref ref;
 
 	if (!mp)
 		return ENOENT;
@@ -2556,18 +2615,34 @@ int ext4_readlink(const char *path, char *buf, size_t bufsize, size_t *rcnt)
 	if (!buf)
 		return EINVAL;
 
-	filetype = EXT4_DE_SYMLINK;
-
 	EXT4_MP_LOCK(mp);
 	ext4_block_cache_write_back(mp->fs.bdev, 1);
-	r = ext4_generic_open2(&f, path, O_RDONLY, filetype, NULL, NULL);
-	if (r == EOK)
-		r = ext4_fread(&f, buf, bufsize, rcnt);
-	else
+	r = ext4_generic_open2(&f, path, O_RDONLY, EXT4_DE_UNKNOWN, NULL, NULL);
+	if (r != EOK)
 		goto Finish;
 
-	ext4_fclose(&f);
+	r = ext4_fs_get_inode_ref(&mp->fs, f.inode, &ref);
+	if (r != EOK)
+		goto Close;
 
+	if (!ext4_inode_is_type(&mp->fs.sb, ref.inode, EXT4_INODE_MODE_SOFTLINK)) {
+		r = EINVAL;
+		goto PutInode;
+	}
+
+	r = ext4_fs_put_inode_ref(&ref);
+	if (r != EOK)
+		goto Close;
+
+	r = ext4_fread(&f, buf, bufsize, rcnt);
+
+Close:
+	ext4_fclose(&f);
+	goto Finish;
+
+PutInode:
+	ext4_fs_put_inode_ref(&ref);
+	ext4_fclose(&f);
 Finish:
 	ext4_block_cache_write_back(mp->fs.bdev, 0);
 	EXT4_MP_UNLOCK(mp);

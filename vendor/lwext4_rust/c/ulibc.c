@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+#include <stdio.h>
 
 #include "ext4_debug.h"
 

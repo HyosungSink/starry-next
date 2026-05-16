@@ -292,18 +292,54 @@ int ext4_blocks_get_direct(struct ext4_blockdev *bdev, void *buf, uint64_t lba,
 	return ext4_bdif_bread(bdev, buf, pba, pb_cnt * cnt);
 }
 
+static void ext4_blocks_sync_cached(struct ext4_blockdev *bdev,
+				    const uint8_t *buf,
+				    uint64_t lba,
+				    uint32_t cnt)
+{
+	struct ext4_bcache *bc = bdev->bc;
+	uint32_t i;
+
+	if (!bc)
+		return;
+
+	for (i = 0; i < cnt; i++) {
+		struct ext4_block block;
+		struct ext4_buf *cached;
+
+		cached = ext4_bcache_find_get(bc, &block, lba + i);
+		if (!cached)
+			continue;
+
+		memcpy(block.data, buf + ((uint64_t)i * bdev->lg_bsize),
+		       bdev->lg_bsize);
+		ext4_bcache_set_flag(block.buf, BC_UPTODATE);
+		if (ext4_bcache_test_flag(block.buf, BC_DIRTY)) {
+			ext4_bcache_remove_dirty_node(bc, block.buf);
+			ext4_bcache_clear_flag(block.buf, BC_DIRTY);
+		}
+
+		ext4_bcache_free(bc, &block);
+	}
+}
+
 int ext4_blocks_set_direct(struct ext4_blockdev *bdev, const void *buf,
 			   uint64_t lba, uint32_t cnt)
 {
 	uint64_t pba;
 	uint32_t pb_cnt;
+	int r;
 
 	ext4_assert(bdev && buf);
 
 	pba = (lba * bdev->lg_bsize + bdev->part_offset) / bdev->bdif->ph_bsize;
 	pb_cnt = bdev->lg_bsize / bdev->bdif->ph_bsize;
 
-	return ext4_bdif_bwrite(bdev, buf, pba, pb_cnt * cnt);
+	r = ext4_bdif_bwrite(bdev, buf, pba, pb_cnt * cnt);
+	if (r == EOK)
+		ext4_blocks_sync_cached(bdev, buf, lba, cnt);
+
+	return r;
 }
 
 int ext4_block_writebytes(struct ext4_blockdev *bdev, uint64_t off,

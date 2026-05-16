@@ -35,18 +35,19 @@ fn main() {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let lwext4_lib = &format!("lwext4-{}", arch);
     let lwext4_lib_path = &format!("c/lwext4/lib{}.a", lwext4_lib);
-    if !Path::new(lwext4_lib_path).exists() {
-        let status = Command::new("make")
-            .args(&[
-                "musl-generic",
-                "-C",
-                c_path.to_str().expect("invalid path of lwext4"),
-            ])
-            .arg(&format!("ARCH={}", arch))
-            .status()
-            .expect("failed to execute process: make lwext4");
-        assert!(status.success());
+    let missing_lib = !Path::new(lwext4_lib_path).exists();
+    let status = Command::new("make")
+        .args(&[
+            "musl-generic",
+            "-C",
+            c_path.to_str().expect("invalid path of lwext4"),
+        ])
+        .arg(&format!("ARCH={}", arch))
+        .status()
+        .expect("failed to execute process: make lwext4");
+    assert!(status.success());
 
+    if missing_lib {
         let cc = &format!("{}-linux-musl-gcc", arch);
         let output = Command::new(cc)
             .args(["-print-sysroot"])
@@ -86,26 +87,9 @@ fn main() {
 fn generates_bindings_to_rust(_mpath: &str) {}
 
 #[cfg(not(target_arch = "x86_64"))]
-fn generates_bindings_to_rust(mpath: &str) {
-    let bindings = bindgen::Builder::default()
-        .use_core()
-        // The input header we would like to generate bindings for.
-        .header("c/wrapper.h")
-        //.clang_arg("--sysroot=/path/to/sysroot")
-        .clang_arg(mpath)
-        //.clang_arg("-I../../ulib/axlibc/include")
-        .clang_arg("-I./c/lwext4/include")
-        .clang_arg("-I./c/lwext4/build_musl-generic/include/")
-        .layout_tests(false)
-        // Tell cargo to invalidate the built crate whenever any of the included header files changed.
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        // Finish the builder and generate the bindings.
-        .generate()
-        .expect("Unable to generate bindings");
-
-    // Write the bindings to the $OUT_DIR/bindings.rs file.
-    let out_path = PathBuf::from("src");
-    bindings
-        .write_to_file(out_path.join("bindings.rs"))
-        .expect("Couldn't write bindings!");
+fn generates_bindings_to_rust(_mpath: &str) {
+    assert!(
+        Path::new("src/bindings.rs").exists(),
+        "missing vendored bindings.rs for lwext4_rust"
+    );
 }
