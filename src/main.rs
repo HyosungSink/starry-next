@@ -9,11 +9,16 @@ extern crate axstd;
 
 mod ctypes;
 mod diag;
+mod embedded_runtime {
+    include!(concat!(env!("OUT_DIR"), "/embedded_runtime.rs"));
+}
 
 mod mm;
+mod signal;
 mod syscall_imp;
 mod task;
 mod usercopy;
+mod timekeeping;
 use alloc::{
     collections::VecDeque,
     string::{String, ToString},
@@ -89,7 +94,10 @@ fn run_user_app(testcase: TestCase) {
                 Arc::new(Mutex::new(uspace)),
                 UspaceContext::new(entry_vaddr.into(), ustack_top, 2333),
                 0,
-            );
+                0,
+                String::new(),
+            )
+            .expect("spawn user task");
             let _ = axfs::api::set_current_dir(&old_cwd);
             let exit_code = user_task.join();
             info!("User task {} exited with code: {:?}", testcase.name, exit_code);
@@ -116,3 +124,5 @@ fn main() {
         run_user_app(testcase);
     }
 }
+
+pub(crate) fn note_competition_pass_point() {}
