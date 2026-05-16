@@ -7,11 +7,13 @@ use axsync::Mutex;
 use fatfs::{Dir, File, LossyOemCpConverter, NullTimeProvider, Read, Seek, SeekFrom, Write};
 
 use crate::dev::Disk;
+#[cfg(feature = "fatfs")]
+use crate::dev::SharedRamDisk;
 
 const BLOCK_SIZE: usize = 512;
 
-pub struct FatFileSystem {
-    inner: fatfs::FileSystem<Disk, NullTimeProvider, LossyOemCpConverter>,
+pub struct FatFileSystem<IO: IoTrait = Disk> {
+    inner: fatfs::FileSystem<IO, NullTimeProvider, LossyOemCpConverter>,
     root_dir: UnsafeCell<Option<VfsNodeRef>>,
 }
 
@@ -20,34 +22,37 @@ pub struct DirWrapper<'a, IO: IoTrait>(Dir<'a, IO, NullTimeProvider, LossyOemCpC
 
 pub trait IoTrait: Read + Write + Seek {}
 
-unsafe impl Sync for FatFileSystem {}
-unsafe impl Send for FatFileSystem {}
+unsafe impl<IO: IoTrait> Sync for FatFileSystem<IO> {}
+unsafe impl<IO: IoTrait> Send for FatFileSystem<IO> {}
 unsafe impl<'a, IO: IoTrait> Send for FileWrapper<'a, IO> {}
 unsafe impl<'a, IO: IoTrait> Sync for FileWrapper<'a, IO> {}
 unsafe impl<'a, IO: IoTrait> Send for DirWrapper<'a, IO> {}
 unsafe impl<'a, IO: IoTrait> Sync for DirWrapper<'a, IO> {}
 
-impl FatFileSystem {
-    #[cfg(feature = "use-ramdisk")]
-    pub fn new(mut disk: Disk) -> Self {
-        let opts = fatfs::FormatVolumeOptions::new();
-        fatfs::format_volume(&mut disk, opts).expect("failed to format volume");
-        let inner = fatfs::FileSystem::new(disk, fatfs::FsOptions::new())
-            .expect("failed to initialize FAT filesystem");
-        Self {
+impl<IO: IoTrait + 'static> FatFileSystem<IO> {
+    fn initialize(disk: IO) -> Result<Self, VfsError> {
+        let inner =
+            fatfs::FileSystem::new(disk, fatfs::FsOptions::new()).map_err(|_| VfsError::InvalidInput)?;
+        Ok(Self {
             inner,
             root_dir: UnsafeCell::new(None),
-        }
+        })
+    }
+
+    #[cfg(feature = "use-ramdisk")]
+    pub fn new(mut disk: IO) -> Self {
+        let opts = fatfs::FormatVolumeOptions::new();
+        fatfs::format_volume(&mut disk, opts).expect("failed to format volume");
+        Self::initialize(disk).expect("failed to initialize FAT filesystem")
     }
 
     #[cfg(not(feature = "use-ramdisk"))]
-    pub fn new(disk: Disk) -> Self {
-        let inner = fatfs::FileSystem::new(disk, fatfs::FsOptions::new())
-            .expect("failed to initialize FAT filesystem");
-        Self {
-            inner,
-            root_dir: UnsafeCell::new(None),
-        }
+    pub fn new(disk: IO) -> Self {
+        Self::initialize(disk).expect("failed to initialize FAT filesystem")
+    }
+
+    pub fn try_new(disk: IO) -> VfsResult<Self> {
+        Self::initialize(disk)
     }
 
     pub fn init(&'static self) {
@@ -55,15 +60,15 @@ impl FatFileSystem {
         unsafe { *self.root_dir.get() = Some(Self::new_dir(self.inner.root_dir())) }
     }
 
-    fn new_file<IO: IoTrait>(
-        file: File<'_, IO, NullTimeProvider, LossyOemCpConverter>,
-    ) -> Arc<FileWrapper<IO>> {
+    fn new_file<Inner: IoTrait>(
+        file: File<'static, Inner, NullTimeProvider, LossyOemCpConverter>,
+    ) -> Arc<FileWrapper<'static, Inner>> {
         Arc::new(FileWrapper(Mutex::new(file)))
     }
 
-    fn new_dir<IO: IoTrait>(
-        dir: Dir<'_, IO, NullTimeProvider, LossyOemCpConverter>,
-    ) -> Arc<DirWrapper<IO>> {
+    fn new_dir<Inner: IoTrait>(
+        dir: Dir<'static, Inner, NullTimeProvider, LossyOemCpConverter>,
+    ) -> Arc<DirWrapper<'static, Inner>> {
         Arc::new(DirWrapper(dir))
     }
 }
@@ -96,6 +101,10 @@ impl<IO: IoTrait> VfsNodeOps for FileWrapper<'static, IO> {
         file.seek(SeekFrom::Start(size)).map_err(as_vfs_err)?; // TODO: more efficient
         file.truncate().map_err(as_vfs_err)
     }
+
+    fn fsync(&self) -> VfsResult {
+        Ok(())
+    }
 }
 
 impl<IO: IoTrait> VfsNodeOps for DirWrapper<'static, IO> {
@@ -114,7 +123,7 @@ impl<IO: IoTrait> VfsNodeOps for DirWrapper<'static, IO> {
     fn parent(&self) -> Option<VfsNodeRef> {
         self.0
             .open_dir("..")
-            .map_or(None, |dir| Some(FatFileSystem::new_dir(dir)))
+            .map_or(None, |dir| Some(FatFileSystem::<IO>::new_dir(dir)))
     }
 
     fn lookup(self: Arc<Self>, path: &str) -> VfsResult<VfsNodeRef> {
@@ -129,9 +138,9 @@ impl<IO: IoTrait> VfsNodeOps for DirWrapper<'static, IO> {
 
         // TODO: use `fatfs::Dir::find_entry`, but it's not public.
         if let Ok(file) = self.0.open_file(path) {
-            Ok(FatFileSystem::new_file(file))
+            Ok(FatFileSystem::<IO>::new_file(file))
         } else if let Ok(dir) = self.0.open_dir(path) {
-            Ok(FatFileSystem::new_dir(dir))
+            Ok(FatFileSystem::<IO>::new_dir(dir))
         } else {
             Err(VfsError::NotFound)
         }
@@ -204,7 +213,7 @@ impl<IO: IoTrait> VfsNodeOps for DirWrapper<'static, IO> {
     }
 }
 
-impl VfsOps for FatFileSystem {
+impl<IO: IoTrait + 'static> VfsOps for FatFileSystem<IO> {
     fn root_dir(&self) -> VfsNodeRef {
         let root_dir = unsafe { (*self.root_dir.get()).as_ref().unwrap() };
         root_dir.clone()
@@ -272,6 +281,73 @@ impl Seek for Disk {
     }
 }
 
+#[cfg(feature = "fatfs")]
+impl fatfs::IoBase for SharedRamDisk {
+    type Error = ();
+}
+
+#[cfg(feature = "fatfs")]
+impl IoTrait for SharedRamDisk {}
+
+#[cfg(feature = "fatfs")]
+impl Read for SharedRamDisk {
+    fn read(&mut self, mut buf: &mut [u8]) -> Result<usize, Self::Error> {
+        let mut read_len = 0;
+        while !buf.is_empty() {
+            match self.read_one(buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let tmp = buf;
+                    buf = &mut tmp[n..];
+                    read_len += n;
+                }
+                Err(_) => return Err(()),
+            }
+        }
+        Ok(read_len)
+    }
+}
+
+#[cfg(feature = "fatfs")]
+impl Write for SharedRamDisk {
+    fn write(&mut self, mut buf: &[u8]) -> Result<usize, Self::Error> {
+        let mut write_len = 0;
+        while !buf.is_empty() {
+            match self.write_one(buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf = &buf[n..];
+                    write_len += n;
+                }
+                Err(_) => return Err(()),
+            }
+        }
+        Ok(write_len)
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "fatfs")]
+impl Seek for SharedRamDisk {
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64, Self::Error> {
+        let size = self.size();
+        let new_pos = match pos {
+            SeekFrom::Start(pos) => Some(pos),
+            SeekFrom::Current(off) => self.position().checked_add_signed(off),
+            SeekFrom::End(off) => size.checked_add_signed(off),
+        }
+        .ok_or(())?;
+        if new_pos > size {
+            warn!("Seek beyond the end of the block device");
+        }
+        self.set_position(new_pos);
+        Ok(new_pos)
+    }
+}
+
 fn as_vfs_err<E>(err: fatfs::Error<E>) -> VfsError {
     use fatfs::Error::*;
     match err {
@@ -319,7 +395,11 @@ impl FatFileSystemFromFile {
 
     pub fn init(&'static self) {
         // must be called before later operations
-        unsafe { *self.root_dir.get() = Some(FatFileSystem::new_dir(self.inner.root_dir())) }
+        unsafe {
+            *self.root_dir.get() = Some(FatFileSystem::<FileWrapper<'static, Disk>>::new_dir(
+                self.inner.root_dir(),
+            ))
+        }
     }
 }
 
