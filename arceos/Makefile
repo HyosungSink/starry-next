@@ -107,6 +107,9 @@ export AX_LOG=$(LOG)
 export AX_TARGET=$(TARGET)
 export AX_IP=$(IP)
 export AX_GW=$(GW)
+CARGO_HOME_DIR ?= $(if $(CARGO_HOME),$(CARGO_HOME),$(HOME)/.cargo)
+CARGO_BIN_DIR ?= $(CARGO_HOME_DIR)/bin
+export PATH := $(CARGO_BIN_DIR):$(PATH)
 
 ifneq ($(filter $(MAKECMDGOALS),unittest unittest_no_fail_fast),)
   # When running unit tests, set `AX_CONFIG_PATH` to empty for dummy config

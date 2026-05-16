@@ -66,8 +66,16 @@ axtask = { path = "modules/axtask" }
 axdma = { path = "modules/axdma" }
 
 [patch.crates-io]
-page_table_multiarch = { git = "https://github.com/oscomp/page_table_multiarch.git", rev = "c8a13b0"}
-page_table_entry = { git = "https://github.com/oscomp/page_table_multiarch.git", rev = "c8a13b0" }
+axerrno = { path = "../patches/axerrno" }
+bitmap-allocator = { path = "../vendor/bitmap-allocator" }
+flatten_objects = { path = "../vendor/flatten_objects" }
+page_table_multiarch = { path = "../vendor/page_table_multiarch" }
+page_table_entry = { path = "../vendor/page_table_entry" }
+axfs_ramfs = { path = "../patches/axfs_ramfs" }
+memory_set = { path = "../vendor/memory_set" }
+
+[patch."https://github.com/arceos-org/allocator.git"]
+allocator = { path = "../vendor/allocator" }
 
 [profile.release]
 lto = true

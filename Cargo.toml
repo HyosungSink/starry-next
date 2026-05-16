@@ -8,6 +8,7 @@ repository = "https://github.com/arceos-org/starry-next"
 
 [features]
 lwext4_rs = ["axstd/lwext4_rs"]
+contest_diag_logs = []
 
 [dependencies]
 log = "0.4"
@@ -24,21 +25,35 @@ num_enum = { version = "0.7", default-features = false }
 syscalls = { version = "0.6", default-features = false }
 numeric-enum-macro = "0.2.0"
 
-axconfig = { git = "https://github.com/oscomp/arceos.git" }
-axfs = { git = "https://github.com/oscomp/arceos.git" }
-axstd = { git = "https://github.com/oscomp/arceos.git", features = ["paging"] }
-axhal = { git = "https://github.com/oscomp/arceos.git", features = ["uspace"] }
-axmm = { git = "https://github.com/oscomp/arceos.git" }
-axtask = { git = "https://github.com/oscomp/arceos.git" }
-axsync = { git = "https://github.com/oscomp/arceos.git" }
-axruntime = { git = "https://github.com/oscomp/arceos.git", features = ["multitask"] }
-arceos_posix_api = { git = "https://github.com/oscomp/arceos.git", features = ["uspace", "smp", "irq", "fs", "multitask", "net", "pipe", "select", "epoll"] }
-axns = { git = "https://github.com/oscomp/arceos.git", features = ["thread-local"] }
+axconfig = { path = "arceos/modules/axconfig" }
+axalloc = { path = "arceos/modules/axalloc" }
+axfs = { path = "arceos/modules/axfs" }
+axstd = { path = "arceos/ulib/axstd", features = ["paging"] }
+axhal = { path = "arceos/modules/axhal", features = ["uspace"] }
+axmm = { path = "arceos/modules/axmm" }
+axtask = { path = "arceos/modules/axtask" }
+axsync = { path = "arceos/modules/axsync" }
+axruntime = { path = "arceos/modules/axruntime", features = ["multitask"] }
+arceos_api = { path = "arceos/api/arceos_api", features = ["alloc"] }
+arceos_posix_api = { path = "arceos/api/arceos_posix_api", features = ["uspace", "smp", "irq", "fs", "multitask", "net", "pipe", "select", "epoll"] }
+axns = { path = "arceos/modules/axns", features = ["thread-local"] }
 
 [patch.crates-io]
 syscalls = { git = "https://github.com/jasonwhite/syscalls.git", rev = "92624de"}
-page_table_multiarch = { git = "https://github.com/yfblock/page_table_multiarch.git", rev = "c8a13b0"}
-page_table_entry = { git = "https://github.com/yfblock/page_table_multiarch.git", rev = "c8a13b0" }
+axerrno = { path = "patches/axerrno" }
+bitmap-allocator = { path = "vendor/bitmap-allocator" }
+flatten_objects = { path = "vendor/flatten_objects" }
+page_table_multiarch = { path = "vendor/page_table_multiarch" }
+page_table_entry = { path = "vendor/page_table_entry" }
+axfs_ramfs = { path = "patches/axfs_ramfs" }
+memory_set = { path = "vendor/memory_set" }
+
+[patch."https://github.com/arceos-org/allocator.git"]
+allocator = { path = "vendor/allocator" }
+
+[patch."https://github.com/arceos-org/scheduler.git"]
+scheduler = { path = "patches/scheduler" }
+
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86 = "0.52"

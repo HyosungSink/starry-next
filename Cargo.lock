@@ -23,10 +23,11 @@ dependencies = [
 [[package]]
 name = "allocator"
 version = "0.1.1"
-source = "git+https://github.com/arceos-org/allocator.git?tag=v0.1.1#1d5b7a1b4fd8db4c9c9cea4e6012d15d42e2bf40"
 dependencies = [
  "bitmap-allocator",
+ "buddy_system_allocator",
  "cfg-if",
+ "log",
  "rlsf",
 ]
 
@@ -84,6 +85,7 @@ dependencies = [
 name = "arceos_api"
 version = "0.1.0"
 dependencies = [
+ "axalloc",
  "axconfig",
  "axerrno",
  "axfeat",
@@ -255,8 +257,6 @@ dependencies = [
 [[package]]
 name = "axerrno"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66ccd41dd4ef364e2385901a5c2a3adea974a41eccb2529c1f24e4c8bc93d834"
 dependencies = [
  "log",
 ]
@@ -281,6 +281,7 @@ dependencies = [
 name = "axfs"
 version = "0.1.0"
 dependencies = [
+ "axconfig",
  "axdriver",
  "axdriver_block",
  "axerrno",
@@ -313,8 +314,6 @@ dependencies = [
 [[package]]
 name = "axfs_ramfs"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db46c6dae25a123579d5fdcdcc502d0dc2a8af86646106004c8a9181433271b1"
 dependencies = [
  "axfs_vfs",
  "log",
@@ -471,6 +470,7 @@ dependencies = [
 name = "axtask"
 version = "0.1.0"
 dependencies = [
+ "axalloc",
  "axconfig",
  "axhal",
  "cfg-if",
@@ -542,10 +542,9 @@ checksum = "8f68f53c83ab957f72c32642f3868eec03eb974d1fb82e453128456482613d36"
 [[package]]
 name = "bitmap-allocator"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5553d824a3564e1c242975cfc962d15e6299bfa4a90c44c14208673c16df51f3"
 dependencies = [
  "bit_field",
+ "log",
 ]
 
 [[package]]
@@ -553,6 +552,12 @@ name = "bitmaps"
 version = "3.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1d084b0137aaa901caf9f1e8b21daa6aa24d41cd806e111335541eff9683bd6"
+
+[[package]]
+name = "buddy_system_allocator"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7913f22349ffcfc6ca0ca9a656ec26cfbba538ed49c31a273dff2c5d1ea83d9"
 
 [[package]]
 name = "byteorder"
@@ -783,8 +788,6 @@ dependencies = [
 [[package]]
 name = "flatten_objects"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f593e2a150ea7985fb62614fac12bb1dec8d91ea3a92bc2cbd07746b289645a3"
 dependencies = [
  "bitmaps",
 ]
@@ -1006,7 +1009,6 @@ dependencies = [
 [[package]]
 name = "lwext4_rust"
 version = "0.2.0"
-source = "git+https://github.com/Azure-stars/lwext4_rust.git#d1561e971c37555428695b12b869ec938af5a058"
 dependencies = [
  "log",
 ]
@@ -1032,8 +1034,6 @@ checksum = "6f769efcf10b9dfb4c913bebb409cda77b1a3f072b249bf5465e250bcb30eb49"
 [[package]]
 name = "memory_set"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "335675b7ab07460f532d3b2b557313be73037fdf81b65464d8c0d8bd90d2fbf9"
 dependencies = [
  "memory_addr",
 ]
@@ -1104,7 +1104,6 @@ checksum = "945462a4b81e43c4e3ba96bd7b49d834c6f61198356aa858733bc4acf3cbe62e"
 [[package]]
 name = "page_table_entry"
 version = "0.5.1"
-source = "git+https://github.com/yfblock/page_table_multiarch.git?rev=c8a13b0#c8a13b0fe4af4d3b2ef2b57cc5fff3f6495424b9"
 dependencies = [
  "aarch64-cpu",
  "bitflags 2.8.0",
@@ -1115,7 +1114,6 @@ dependencies = [
 [[package]]
 name = "page_table_multiarch"
 version = "0.5.1"
-source = "git+https://github.com/yfblock/page_table_multiarch.git?rev=c8a13b0#c8a13b0fe4af4d3b2ef2b57cc5fff3f6495424b9"
 dependencies = [
  "log",
  "memory_addr",
@@ -1344,7 +1342,6 @@ checksum = "e6e36312fb5ddc10d08ecdc65187402baba4ac34585cb9d1b78522ae2358d890"
 [[package]]
 name = "scheduler"
 version = "0.1.0"
-source = "git+https://github.com/arceos-org/scheduler.git?tag=v0.1.0#c8d25d9aed146dca28dc8987afd229b52c20361a"
 dependencies = [
  "linked_list",
 ]
@@ -1400,7 +1397,9 @@ checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 name = "starry"
 version = "0.1.0"
 dependencies = [
+ "arceos_api",
  "arceos_posix_api",
+ "axalloc",
  "axconfig",
  "axerrno",
  "axfs",

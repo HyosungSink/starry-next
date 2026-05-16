@@ -32,11 +32,11 @@ dependencies = [
 [[package]]
 name = "allocator"
 version = "0.1.1"
-source = "git+https://github.com/arceos-org/allocator.git?tag=v0.1.1#1d5b7a1b4fd8db4c9c9cea4e6012d15d42e2bf40"
 dependencies = [
  "bitmap-allocator",
  "buddy_system_allocator",
  "cfg-if",
+ "log",
  "rlsf",
  "slab_allocator",
 ]
@@ -429,8 +429,6 @@ dependencies = [
 [[package]]
 name = "axfs_ramfs"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db46c6dae25a123579d5fdcdcc502d0dc2a8af86646106004c8a9181433271b1"
 dependencies = [
  "axfs_vfs",
  "log",
@@ -607,6 +605,7 @@ dependencies = [
 name = "axtask"
 version = "0.1.0"
 dependencies = [
+ "axalloc",
  "axconfig",
  "axhal",
  "axtask",
@@ -691,10 +690,9 @@ checksum = "8f68f53c83ab957f72c32642f3868eec03eb974d1fb82e453128456482613d36"
 [[package]]
 name = "bitmap-allocator"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5553d824a3564e1c242975cfc962d15e6299bfa4a90c44c14208673c16df51f3"
 dependencies = [
  "bit_field",
+ "log",
 ]
 
 [[package]]
@@ -1235,7 +1233,6 @@ dependencies = [
 [[package]]
 name = "lwext4_rust"
 version = "0.2.0"
-source = "git+https://github.com/Azure-stars/lwext4_rust.git#d1561e971c37555428695b12b869ec938af5a058"
 dependencies = [
  "log",
 ]
@@ -1307,7 +1304,6 @@ checksum = "1261fe7e33c73b354eab43b1273a57c8f967d0391e80353e51f764ac02cf6775"
 [[package]]
 name = "page_table_entry"
 version = "0.5.1"
-source = "git+https://github.com/oscomp/page_table_multiarch.git?rev=c8a13b0#c8a13b0fe4af4d3b2ef2b57cc5fff3f6495424b9"
 dependencies = [
  "aarch64-cpu 10.0.0",
  "bitflags 2.8.0",
@@ -1318,7 +1314,6 @@ dependencies = [
 [[package]]
 name = "page_table_multiarch"
 version = "0.5.1"
-source = "git+https://github.com/oscomp/page_table_multiarch.git?rev=c8a13b0#c8a13b0fe4af4d3b2ef2b57cc5fff3f6495424b9"
 dependencies = [
  "log",
  "memory_addr",
