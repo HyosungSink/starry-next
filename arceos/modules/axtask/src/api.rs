@@ -5,9 +5,14 @@ use alloc::{
     sync::{Arc, Weak},
 };
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use kernel_guard::NoPreemptIrqSave;
 
 pub(crate) use crate::run_queue::{current_run_queue, select_run_queue};
+
+static WAIT_INTERRUPT_HOOK: AtomicUsize = AtomicUsize::new(0);
+static TASK_SWITCH_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 #[doc(cfg(feature = "multitask"))]
 pub use crate::task::{CurrentTask, TaskId, TaskInner};
@@ -74,6 +79,32 @@ pub fn current_may_uninit() -> Option<CurrentTask> {
 /// Panics if the current task is not initialized.
 pub fn current() -> CurrentTask {
     CurrentTask::get()
+}
+
+pub fn set_wait_interrupt_hook(hook: fn() -> bool) {
+    WAIT_INTERRUPT_HOOK.store(hook as usize, Ordering::Release);
+}
+
+pub fn current_wait_should_interrupt() -> bool {
+    let hook = WAIT_INTERRUPT_HOOK.load(Ordering::Acquire);
+    if hook == 0 {
+        return false;
+    }
+    let hook: fn() -> bool = unsafe { core::mem::transmute(hook) };
+    hook()
+}
+
+pub fn set_task_switch_hook(hook: fn(*mut u8, *mut u8, usize)) {
+    TASK_SWITCH_HOOK.store(hook as usize, Ordering::Release);
+}
+
+pub(crate) fn notify_task_switch(prev_task_ext: *mut u8, next_task_ext: *mut u8, now: usize) {
+    let hook = TASK_SWITCH_HOOK.load(Ordering::Acquire);
+    if hook == 0 {
+        return;
+    }
+    let hook: fn(*mut u8, *mut u8, usize) = unsafe { core::mem::transmute(hook) };
+    hook(prev_task_ext, next_task_ext, now);
 }
 
 /// Initializes the task scheduler (for the primary CPU).
