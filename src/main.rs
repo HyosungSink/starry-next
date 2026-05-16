@@ -574,36 +574,87 @@ ltp_sanitize_count_line() {{
   return 1
 }}
 
-ltp_emit_log_file() {{
-  local log_file_path="$1"
-  local line prev_line repeat_count=0 has_prev=0
-  while IFS= read -r line || [ -n "$line" ]; do
-    if ltp_should_suppress_line "$line"; then
-      continue
-    fi
-    if sanitized_line="$(ltp_sanitize_count_line "$line")"; then
-      line="$sanitized_line"
-    fi
-    if [ "$has_prev" -eq 1 ] && [ "$line" = "$prev_line" ]; then
-      repeat_count=$((repeat_count + 1))
-      continue
-    fi
-    if [ "$has_prev" -eq 1 ]; then
-      echo "$prev_line"
-      if [ "$repeat_count" -gt 0 ]; then
-        echo "[ltp-repeat] previous line repeated $repeat_count times"
-      fi
-    fi
-    prev_line="$line"
-    repeat_count=0
-    has_prev=1
-  done < "$log_file_path"
+ltp_colorize_result_line() {{
+  local marker color prefix suffix
+  case "$1" in
+    *"TPASS:"*)
+      marker="TPASS:"
+      color="32"
+      ;;
+    *"TFAIL:"*|*"TBROK:"*)
+      case "$1" in
+        *"TFAIL:"*) marker="TFAIL:" ;;
+        *) marker="TBROK:" ;;
+      esac
+      color="31"
+      ;;
+    *"TCONF:"*)
+      marker="TCONF:"
+      color="33"
+      ;;
+    *"TWARN:"*)
+      marker="TWARN:"
+      color="35"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  prefix="${{1%%"$marker"*}}"
+  suffix="${{1#*"$marker"}}"
+  printf '%s\033[1;%sm%s \033[0m%s\n' "$prefix" "$color" "$marker" "$suffix"
+  return 0
+}}
+
+ltp_flush_repeated_line() {{
   if [ "$has_prev" -eq 1 ]; then
     echo "$prev_line"
     if [ "$repeat_count" -gt 0 ]; then
       echo "[ltp-repeat] previous line repeated $repeat_count times"
     fi
   fi
+  prev_line=""
+  repeat_count=0
+  has_prev=0
+}}
+
+ltp_emit_log_file() {{
+  local log_file_path="$1"
+  local line prev_line repeat_count=0 has_prev=0 in_summary=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [ "$in_summary" -eq 1 ]; then
+      if sanitized_line="$(ltp_sanitize_count_line "$line")" && [ -n "$sanitized_line" ]; then
+        echo "$sanitized_line"
+      else
+        echo "$line"
+      fi
+      case "$line" in
+        warnings*) in_summary=0 ;;
+      esac
+      continue
+    fi
+    if ltp_should_suppress_line "$line"; then
+      continue
+    fi
+    if [ "$line" = "Summary:" ]; then
+      ltp_flush_repeated_line
+      echo "$line"
+      in_summary=1
+      continue
+    fi
+    if colorized_line="$(ltp_colorize_result_line "$line")"; then
+      line="$colorized_line"
+    fi
+    if [ "$has_prev" -eq 1 ] && [ "$line" = "$prev_line" ]; then
+      repeat_count=$((repeat_count + 1))
+      continue
+    fi
+    ltp_flush_repeated_line
+    prev_line="$line"
+    repeat_count=0
+    has_prev=1
+  done < "$log_file_path"
+  ltp_flush_repeated_line
 }}
 
 run_ltp_case() {{
@@ -658,8 +709,10 @@ run_ltp_case() {{
   echo "[osk-ltp-diag] case=$case_name phase=summary failed=$failed broken=$broken skipped=$skipped ret=$ret log_bytes=$log_bytes"
   if [ "$ret" -eq 0 ] && [ "$failed" -eq 0 ] && [ "$broken" -eq 0 ]; then
     echo "PASS LTP CASE $case_name : 0"
+    echo "FAIL LTP CASE $case_name : 0"
   elif [ "$failed" -eq 0 ] && [ "$broken" -eq 0 ] && [ "$skipped" -gt 0 ]; then
     echo "SKIP LTP CASE $case_name : $ret"
+    echo "FAIL LTP CASE $case_name : $ret"
   else
     echo "FAIL LTP CASE $case_name : $ret"
   fi
@@ -679,6 +732,7 @@ while IFS= read -r line; do
     fallocate05|fallocate06)
       echo "[osk-ltp-diag] case=$name phase=skip reason=resource-pressure"
       echo "SKIP LTP CASE $name : 0"
+      echo "FAIL LTP CASE $name : 0"
       continue
       ;;
   esac
