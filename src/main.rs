@@ -8,6 +8,7 @@ extern crate alloc;
 extern crate axstd;
 
 mod ctypes;
+mod diag;
 
 mod mm;
 mod syscall_imp;
