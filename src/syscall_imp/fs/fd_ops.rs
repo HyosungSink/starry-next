@@ -13,3 +13,10 @@ pub(crate) fn sys_dup3(old_fd: c_int, new_fd: c_int) -> c_int {
 pub(crate) fn sys_close(fd: c_int) -> c_int {
     api::sys_close(fd)
 }
+
+pub(crate) fn notify_lease_break_for_fd(
+    _fd: core::ffi::c_int,
+    _write_like: bool,
+    _truncating: bool,
+) {
+}
