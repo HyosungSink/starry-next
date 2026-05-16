@@ -252,11 +252,7 @@ impl TcpSocket {
     }
 
     /// Close the connection.
-    pub fn shutdown(&self) -> AxResult {
-        self.shutdown_with(Shutdown::ReadWrite)
-    }
-
-    pub fn shutdown_with(&self, how: Shutdown) -> AxResult {
+    pub fn shutdown(&self, how: Shutdown) -> AxResult {
         // stream
         if self.is_connected() {
             // SAFETY: `self.handle` should be initialized in a connected socket.
@@ -625,7 +621,7 @@ fn timeout_from_us(timeout_us: u64) -> Option<Duration> {
 
 impl Drop for TcpSocket {
     fn drop(&mut self) {
-        self.shutdown_with(Shutdown::ReadWrite).ok();
+        self.shutdown(Shutdown::ReadWrite).ok();
         // Safe because we have mut reference to `self`.
         if let Some(handle) = unsafe { self.handle.get().read() } {
             let drain_deadline = monotonic_time() + Duration::from_millis(20);
