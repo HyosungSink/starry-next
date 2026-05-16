@@ -1850,19 +1850,6 @@ pub(crate) fn sys_arch_prctl(code: i32, addr: u64) -> isize {
 }
 
 pub(crate) fn sys_clone(
-    flags: usize,
-    user_stack: usize,
-    ptid: usize,
-    arg3: usize,
-    arg4: usize,
-) -> isize {
-    let trap_frame = crate::task::read_trapframe_from_kstack(
-        current().get_kernel_stack_top().unwrap(),
-    );
-    sys_clone_with_trap(&trap_frame, flags, user_stack, ptid, arg3, arg4)
-}
-
-pub(crate) fn sys_clone_with_trap(
     tf: &TrapFrame,
     flags: usize,
     user_stack: usize,

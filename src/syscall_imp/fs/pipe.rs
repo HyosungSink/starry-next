@@ -4,7 +4,7 @@ use core::ffi::c_void;
 use arceos_posix_api as api;
 use axtask::current;
 
-pub(crate) fn sys_pipe2_with_flags(fds: *mut i32, flags: i32) -> c_int {
+pub(crate) fn sys_pipe2(fds: *mut i32, flags: i32) -> c_int {
     let curr = current();
     if curr.name().contains("userboot") {
         crate::diag_warn!(
@@ -29,8 +29,4 @@ pub(crate) fn sys_pipe2_with_flags(fds: *mut i32, flags: i32) -> c_int {
         }
     }
     ret
-}
-
-pub(crate) fn sys_pipe2(fds: *mut i32) -> c_int {
-    sys_pipe2_with_flags(fds, 0)
 }

@@ -1259,7 +1259,7 @@ pub(crate) fn sys_eventfd2(initval: u32, flags: c_int) -> c_int {
     api::sys_eventfd2(initval, flags)
 }
 
-pub(crate) fn sys_dup3_with_flags(old_fd: c_int, new_fd: c_int, flags: c_int) -> c_int {
+pub(crate) fn sys_dup3(old_fd: c_int, new_fd: c_int, flags: c_int) -> c_int {
     syscall_body!(sys_dup3, {
         let flags = flags as u32;
         if old_fd == new_fd {
@@ -1452,8 +1452,4 @@ pub(crate) fn sys_close_range(first: u32, last: u32, flags: u32) -> isize {
         }
         Ok(0)
     })
-}
-
-pub(crate) fn sys_dup3(old_fd: c_int, new_fd: c_int) -> c_int {
-    sys_dup3_with_flags(old_fd, new_fd, 0)
 }
