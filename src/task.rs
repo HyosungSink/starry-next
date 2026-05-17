@@ -342,6 +342,69 @@ pub(crate) fn prepare_runtime_for_exec(reason: &str, path: &str) {
     }
 }
 
+fn exec_low_memory_deny_threshold_pages() -> usize {
+    runtime_reclaim_low_watermark_pages().saturating_mul(2)
+}
+
+fn should_reject_exec_for_low_memory(path: &str) -> bool {
+    let deny_threshold = exec_low_memory_deny_threshold_pages();
+    let mut available_pages = global_allocator().available_pages();
+    if available_pages > deny_threshold {
+        return false;
+    }
+
+    let mut reclaimed = reclaim_runtime_memory_detail("exec_low_memory_guard");
+    available_pages = global_allocator().available_pages();
+    if available_pages > deny_threshold {
+        debug!(
+            "exec resumed after low-memory reclaim: path={} available_pages={} deny_threshold={} reclaimed_stack_pages={} reclaimed_exec_cache_pages={} reclaimed_fs_cache_entries={}",
+            path,
+            available_pages,
+            deny_threshold,
+            reclaimed.stack_pages,
+            reclaimed.exec_cache_pages,
+            reclaimed.fs_cache_entries,
+        );
+        return false;
+    }
+
+    crate::mm::invalidate_exec_cache_path(path);
+    let retry = reclaim_runtime_memory_detail("exec_low_memory_guard_retry");
+    reclaimed.stack_pages = reclaimed.stack_pages.saturating_add(retry.stack_pages);
+    reclaimed.exec_cache_pages = reclaimed
+        .exec_cache_pages
+        .saturating_add(retry.exec_cache_pages);
+    reclaimed.fs_cache_entries = reclaimed
+        .fs_cache_entries
+        .saturating_add(retry.fs_cache_entries);
+    available_pages = global_allocator().available_pages();
+    if available_pages > deny_threshold {
+        debug!(
+            "exec resumed after path cache reclaim: path={} available_pages={} deny_threshold={} reclaimed_stack_pages={} reclaimed_exec_cache_pages={} reclaimed_fs_cache_entries={}",
+            path,
+            available_pages,
+            deny_threshold,
+            reclaimed.stack_pages,
+            reclaimed.exec_cache_pages,
+            reclaimed.fs_cache_entries,
+        );
+        return false;
+    }
+
+    if should_log_exec_prepare_pressure() {
+        warn!(
+            "exec denied under memory pressure: path={} available_pages={} deny_threshold={} reclaimed_stack_pages={} reclaimed_exec_cache_pages={} reclaimed_fs_cache_entries={}",
+            path,
+            available_pages,
+            deny_threshold,
+            reclaimed.stack_pages,
+            reclaimed.exec_cache_pages,
+            reclaimed.fs_cache_entries,
+        );
+    }
+    true
+}
+
 pub(crate) fn proc_pid_max_contents() -> String {
     alloc::format!("{}\n", PROC_PID_MAX.load(Ordering::Acquire))
 }
@@ -2524,6 +2587,9 @@ where
         let mut load_fresh =
             || -> AxResult<(AddrSpace, (VirtAddr, VirtAddr, VirtAddr, usize, usize))> {
                 prepare_runtime_for_exec("exec_prepare", path);
+                if should_reject_exec_for_low_memory(path) {
+                    return Err(AxError::NoMemory);
+                }
                 let mut new_aspace = axmm::new_user_aspace(
                     memory_addr::VirtAddr::from_usize(axconfig::plat::USER_SPACE_BASE),
                     axconfig::plat::USER_SPACE_SIZE,
