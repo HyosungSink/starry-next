@@ -148,9 +148,6 @@ impl MappingBackend for Backend {
                     .range(range_start..range_end)
                     .map(|(page, frame)| (*page, *frame))
                     .collect();
-                let page_frames: Vec<PhysAddr> =
-                    page_snapshot.iter().map(|(_, frame)| *frame).collect();
-                inc_frame_refs(&page_frames);
                 let new_pages =
                     Arc::new(SpinNoIrq::new(page_snapshot.into_iter().collect::<BTreeMap<_, _>>()));
                 let new_shared = shared.as_ref().map(|shared_frames| {
