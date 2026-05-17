@@ -2243,7 +2243,6 @@ fn handle_page_fault(vaddr: VirtAddr, access_flags: MappingFlags, is_user: bool)
                     global_allocator().available_pages(),
                     USER_FAULT_OOM_KILL_THRESHOLD_PAGES,
                 );
-                let _ = crate::task::abort_current_competition_script(9, "page-fault-oom");
                 crate::task::exit_current_task(
                     crate::task::wait_status_signaled(SIGSEGV, true),
                     true,
