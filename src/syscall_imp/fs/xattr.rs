@@ -257,7 +257,12 @@ pub(crate) fn sys_getxattr(
     size: usize,
 ) -> isize {
     syscall_body!(sys_getxattr, {
-        get_xattr(target_from_path(path, true)?, validate_name(name)?, value, size)
+        get_xattr(
+            target_from_path(path, true)?,
+            validate_name(name)?,
+            value,
+            size,
+        )
     })
 }
 
@@ -332,7 +337,13 @@ pub(crate) fn sys_fsetxattr(
     flags: i32,
 ) -> isize {
     syscall_body!(sys_fsetxattr, {
-        set_xattr(target_from_fd(fd)?, validate_name(name)?, value, size, flags)
+        set_xattr(
+            target_from_fd(fd)?,
+            validate_name(name)?,
+            value,
+            size,
+            flags,
+        )
     })
 }
 
