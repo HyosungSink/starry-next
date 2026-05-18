@@ -487,7 +487,7 @@ fn has_waiting_writer_conflict(
     end: i64,
 ) -> bool {
     LOCK_WAITERS.lock().iter().any(|waiter| {
-        ticket != Some(waiter.ticket)
+        ticket.map_or(true, |ticket| waiter.ticket < ticket)
             && waiter.key == key
             && is_write_lock(waiter.typ)
             && !waiter_is_same_owner(waiter, kind, owner_pid, owner_identity)
@@ -724,6 +724,9 @@ fn ofd_lock_state(
     end: i64,
     waiter_ticket: Option<u64>,
 ) -> (bool, bool, bool) {
+    if typ == api::ctypes::F_UNLCK as i16 {
+        return (false, false, false);
+    }
     let posix_conflict = {
         let posix_locks = FILE_LOCKS.lock();
         posix_locks
@@ -793,7 +796,6 @@ fn fcntl_getlk(fd: c_int, arg: usize, ofd: bool) -> Result<c_int, LinuxError> {
         lock.l_pid = conflict.pid;
     } else {
         lock.l_type = api::ctypes::F_UNLCK as i16;
-        lock.l_pid = 0;
     }
     write_value_to_user(arg as *mut UserFlock, lock)?;
     Ok(0)
@@ -1143,19 +1145,16 @@ pub(crate) fn cleanup_all_fd_tracking_for_current_process() {
     clear_waiting_lock(current_pid());
     let (open_fds, identities): (Vec<c_int>, Vec<usize>) = {
         let table = api::FD_TABLE.read();
+        let mut identities = Vec::new();
+        for (_, file) in table.iter() {
+            let identity = file.fcntl_identity();
+            if !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
         (
             table.iter().map(|(fd, _)| fd as c_int).collect(),
-            table
-                .iter()
-                .filter_map(|(_, file)| {
-                    let identity = file.fcntl_identity();
-                    let local_count = table
-                        .iter()
-                        .filter(|(_, other)| other.fcntl_identity() == identity)
-                        .count();
-                    (Arc::strong_count(file) <= local_count).then_some(identity)
-                })
-                .collect(),
+            identities,
         )
     };
     for fd in open_fds {
