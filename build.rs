@@ -1,5 +1,5 @@
 use std::env;
-use std::fs::{File, copy, create_dir_all, read_dir, symlink_metadata};
+use std::fs::{copy, create_dir_all, read_dir, symlink_metadata, File};
 use std::io::{Error, ErrorKind, Result, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -96,8 +96,12 @@ fn generate_embedded_runtime(target_arch: &str) -> Result<()> {
     let rv_glibc_loader =
         optional_vendored_refresh_runtime_file("rv", "glibc", "lib/ld-linux-riscv64-lp64d.so.1");
     let rv_glibc_libc = optional_vendored_refresh_runtime_file("rv", "glibc", "lib/libc.so.6");
+    let rv_glibc_libgcc_s = locate_riscv_glibc_libgcc_s();
+    let rv_musl_libgcc_s = locate_riscv_musl_libgcc_s();
     let la_loader = locate_loongarch_musl_loader();
     let la_libc = locate_loongarch_musl_libc();
+    let la_glibc_libgcc_s = locate_loongarch_glibc_libgcc_s();
+    let la_musl_libgcc_s = locate_loongarch_musl_libgcc_s();
 
     if target_arch == "riscv64" {
         require_runtime("riscv64", "ld-musl-riscv64.so.1", rv_loader.as_ref())?;
@@ -125,12 +129,32 @@ fn generate_embedded_runtime(target_arch: &str) -> Result<()> {
         "rv-glibc-libc.so.6",
         rv_glibc_libc.as_ref(),
     )?;
+    let rv_glibc_libgcc_s_expr = stage_optional_existing_file_expr(
+        &staged_dir,
+        "rv-glibc-libgcc_s.so.1",
+        rv_glibc_libgcc_s.as_ref(),
+    )?;
+    let rv_musl_libgcc_s_expr = stage_optional_existing_file_expr(
+        &staged_dir,
+        "rv-musl-libgcc_s.so.1",
+        rv_musl_libgcc_s.as_ref(),
+    )?;
     let la_loader_expr = stage_runtime_expr(
         &staged_dir,
         "la-ld-musl-loongarch64.so.1",
         la_loader.as_ref(),
     )?;
     let la_libc_expr = stage_runtime_expr(&staged_dir, "la-libc.so", la_libc.as_ref())?;
+    let la_glibc_libgcc_s_expr = stage_optional_existing_file_expr(
+        &staged_dir,
+        "la-glibc-libgcc_s.so.1",
+        la_glibc_libgcc_s.as_ref(),
+    )?;
+    let la_musl_libgcc_s_expr = stage_optional_existing_file_expr(
+        &staged_dir,
+        "la-musl-libgcc_s.so.1",
+        la_musl_libgcc_s.as_ref(),
+    )?;
     let glibc_locale_entries = stage_embedded_file_entries(
         &staged_dir,
         "glibc-locale",
@@ -181,11 +205,27 @@ fn generate_embedded_runtime(target_arch: &str) -> Result<()> {
     )?;
     writeln!(
         out,
+        "pub(crate) const RV_GLIBC_LIBGCC_S: &[u8] = {rv_glibc_libgcc_s_expr};"
+    )?;
+    writeln!(
+        out,
+        "pub(crate) const RV_MUSL_LIBGCC_S: &[u8] = {rv_musl_libgcc_s_expr};"
+    )?;
+    writeln!(
+        out,
         "pub(crate) const LA_MUSL_LOADER: &[u8] = {la_loader_expr};"
     )?;
     writeln!(
         out,
         "pub(crate) const LA_MUSL_LIBC: &[u8] = {la_libc_expr};"
+    )?;
+    writeln!(
+        out,
+        "pub(crate) const LA_GLIBC_LIBGCC_S: &[u8] = {la_glibc_libgcc_s_expr};"
+    )?;
+    writeln!(
+        out,
+        "pub(crate) const LA_MUSL_LIBGCC_S: &[u8] = {la_musl_libgcc_s_expr};"
     )?;
     writeln!(
         out,
@@ -237,20 +277,8 @@ fn generate_embedded_runtime(target_arch: &str) -> Result<()> {
         true,
         false,
     )?;
-    write_embedded_runtime_entry(
-        &mut out,
-        "/lib/libc.so.6",
-        "RV_GLIBC_LIBC",
-        true,
-        false,
-    )?;
-    write_embedded_runtime_entry(
-        &mut out,
-        "/lib64/libc.so.6",
-        "RV_GLIBC_LIBC",
-        true,
-        false,
-    )?;
+    write_embedded_runtime_entry(&mut out, "/lib/libc.so.6", "RV_GLIBC_LIBC", true, false)?;
+    write_embedded_runtime_entry(&mut out, "/lib64/libc.so.6", "RV_GLIBC_LIBC", true, false)?;
     write_embedded_runtime_entry(
         &mut out,
         "/glibc/lib/ld-linux-riscv64-lp64d.so.1",
@@ -265,6 +293,9 @@ fn generate_embedded_runtime(target_arch: &str) -> Result<()> {
         true,
         false,
     )?;
+    write_root_libgcc_entries(&mut out, "RV_MUSL_LIBGCC_S")?;
+    write_musl_libgcc_entries(&mut out, "RV_MUSL_LIBGCC_S")?;
+    write_glibc_libgcc_entries(&mut out, "RV_GLIBC_LIBGCC_S")?;
     for entry in &glibc_locale_entries {
         write_embedded_runtime_entry(
             &mut out,
@@ -319,6 +350,9 @@ fn generate_embedded_runtime(target_arch: &str) -> Result<()> {
     write_embedded_runtime_entry(&mut out, "/lib/libc.so", "LA_MUSL_LIBC", false, false)?;
     write_embedded_runtime_entry(&mut out, "/lib64/libc.so", "LA_MUSL_LIBC", false, false)?;
     write_embedded_runtime_entry(&mut out, "/musl/lib/libc.so", "LA_MUSL_LIBC", false, false)?;
+    write_root_libgcc_entries(&mut out, "LA_MUSL_LIBGCC_S")?;
+    write_musl_libgcc_entries(&mut out, "LA_MUSL_LIBGCC_S")?;
+    write_glibc_libgcc_entries(&mut out, "LA_GLIBC_LIBGCC_S")?;
     for entry in &glibc_locale_entries {
         write_embedded_runtime_entry(
             &mut out,
@@ -353,6 +387,38 @@ fn write_embedded_runtime_entry(
         "    EmbeddedRuntimeFile {{ path: {:?}, data: {}, refresh_if_exists: {}, executable: {} }},",
         path, expr, refresh_if_exists, executable
     )
+}
+
+fn write_root_libgcc_entries(out: &mut File, expr: &str) -> Result<()> {
+    for path in [
+        "/lib/libgcc_s.so.1",
+        "/lib64/libgcc_s.so.1",
+    ] {
+        write_embedded_runtime_entry(out, path, expr, true, false)?;
+    }
+    Ok(())
+}
+
+fn write_musl_libgcc_entries(out: &mut File, expr: &str) -> Result<()> {
+    for path in [
+        "/musl/lib/libgcc_s.so.1",
+        "/musl/lib64/libgcc_s.so.1",
+    ] {
+        write_embedded_runtime_entry(out, path, expr, true, false)?;
+    }
+    Ok(())
+}
+
+fn write_glibc_libgcc_entries(out: &mut File, expr: &str) -> Result<()> {
+    for path in [
+        "/usr/lib/libgcc_s.so.1",
+        "/usr/lib64/libgcc_s.so.1",
+        "/glibc/lib/libgcc_s.so.1",
+        "/glibc/lib64/libgcc_s.so.1",
+    ] {
+        write_embedded_runtime_entry(out, path, expr, true, false)?;
+    }
+    Ok(())
 }
 
 fn require_runtime(arch: &str, name: &str, path: Option<&PathBuf>) -> Result<()> {
@@ -638,6 +704,27 @@ fn locate_riscv_musl_libc() -> Option<PathBuf> {
     )
 }
 
+fn locate_riscv_glibc_libgcc_s() -> Option<PathBuf> {
+    find_runtime_file(
+        &["riscv64-linux-gnu-gcc"],
+        "libgcc_s.so.1",
+        &vec![PathBuf::from("/usr/riscv64-linux-gnu/lib/libgcc_s.so.1")],
+    )
+}
+
+fn locate_riscv_musl_libgcc_s() -> Option<PathBuf> {
+    find_runtime_file(
+        &["riscv64-linux-musl-gcc", "riscv64-buildroot-linux-musl-gcc"],
+        "libgcc_s.so.1",
+        &vec![
+            PathBuf::from("/opt/riscv64-linux-musl-cross/riscv64-linux-musl/lib/libgcc_s.so.1"),
+            PathBuf::from(
+                "/opt/riscv64-lp64d--musl--bleeding-edge-2024.02-1/riscv64-buildroot-linux-musl/sysroot/lib/libgcc_s.so.1",
+            ),
+        ],
+    )
+}
+
 fn locate_loongarch_musl_loader() -> Option<PathBuf> {
     let repo_root = repo_root();
     find_runtime_file(
@@ -654,10 +741,39 @@ fn locate_loongarch_musl_loader() -> Option<PathBuf> {
 
 fn locate_loongarch_musl_libc() -> Option<PathBuf> {
     let repo_root = repo_root();
-    find_runtime_file(&["loongarch64-linux-musl-gcc"], "libc.so", &vec![
-        repo_root.join("testsuits-for-oskernel-pre-2025/runtime/loongarch/lib64/libc.so"),
-        PathBuf::from("/opt/loongarch64-linux-musl-cross/loongarch64-linux-musl/lib/libc.so"),
-    ])
+    find_runtime_file(
+        &["loongarch64-linux-musl-gcc"],
+        "libc.so",
+        &vec![
+            repo_root.join("testsuits-for-oskernel-pre-2025/runtime/loongarch/lib64/libc.so"),
+            PathBuf::from("/opt/loongarch64-linux-musl-cross/loongarch64-linux-musl/lib/libc.so"),
+        ],
+    )
+}
+
+fn locate_loongarch_glibc_libgcc_s() -> Option<PathBuf> {
+    find_runtime_file(
+        &["loongarch64-linux-gnu-gcc"],
+        "libgcc_s.so.1",
+        &vec![
+            PathBuf::from(
+                "/opt/gcc-13.2.0-loongarch64-linux-gnu/loongarch64-linux-gnu/lib64/libgcc_s.so.1",
+            ),
+            PathBuf::from(
+                "/opt/toolchain-loongarch64-linux-gnu-gcc8-host-x86_64-2022-07-18/sysroot/usr/lib64/libgcc_s.so.1",
+            ),
+        ],
+    )
+}
+
+fn locate_loongarch_musl_libgcc_s() -> Option<PathBuf> {
+    find_runtime_file(
+        &["loongarch64-linux-musl-gcc"],
+        "libgcc_s.so.1",
+        &vec![PathBuf::from(
+            "/opt/loongarch64-linux-musl-cross/loongarch64-linux-musl/lib/libgcc_s.so.1",
+        )],
+    )
 }
 
 fn find_runtime_file(
