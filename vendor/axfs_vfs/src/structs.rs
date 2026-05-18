@@ -65,10 +65,12 @@ pub enum VfsNodeType {
     Socket = 0o14,
 }
 
+const VFS_DIRENT_NAME_CAPACITY: usize = 256;
+
 /// Directory entry.
 pub struct VfsDirEntry {
     d_type: VfsNodeType,
-    d_name: [u8; 63],
+    d_name: [u8; VFS_DIRENT_NAME_CAPACITY],
 }
 
 impl VfsNodePerm {
@@ -270,13 +272,13 @@ impl VfsDirEntry {
     pub const fn default() -> Self {
         Self {
             d_type: VfsNodeType::File,
-            d_name: [0; 63],
+            d_name: [0; VFS_DIRENT_NAME_CAPACITY],
         }
     }
 
     /// Creates a new `VfsDirEntry` with the given name and type.
     pub fn new(name: &str, ty: VfsNodeType) -> Self {
-        let mut d_name = [0; 63];
+        let mut d_name = [0; VFS_DIRENT_NAME_CAPACITY];
         if name.len() > d_name.len() {
             log::warn!(
                 "directory entry name too long: {} > {}",
@@ -284,7 +286,8 @@ impl VfsDirEntry {
                 d_name.len()
             );
         }
-        d_name[..name.len()].copy_from_slice(name.as_bytes());
+        let name_len = core::cmp::min(name.len(), d_name.len().saturating_sub(1));
+        d_name[..name_len].copy_from_slice(&name.as_bytes()[..name_len]);
         Self { d_type: ty, d_name }
     }
 

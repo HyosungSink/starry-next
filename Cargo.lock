@@ -324,8 +324,6 @@ dependencies = [
 [[package]]
 name = "axfs_vfs"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2314ebe07a2fef7b1c1a7d15ab817941cd306ace651bb50024b5a8b3e8485359"
 dependencies = [
  "axerrno",
  "bitflags 2.8.0",
@@ -780,7 +778,6 @@ dependencies = [
 [[package]]
 name = "fatfs"
 version = "0.4.0"
-source = "git+https://github.com/rafalh/rust-fatfs?rev=85f06e0#85f06e08edbd3368e1b0562f2fc1b6d178bf7b8a"
 dependencies = [
  "bitflags 2.8.0",
  "log",

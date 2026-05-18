@@ -41,8 +41,7 @@ lwext4_rust = { path = "../../../vendor/lwext4_rust", default-features = false, 
 axns = { workspace = true }
 
 [dependencies.fatfs]
-git = "https://github.com/rafalh/rust-fatfs"
-rev = "85f06e0"
+path = "../../../vendor/fatfs"
 optional = true
 default-features = false
 features = [ # no std

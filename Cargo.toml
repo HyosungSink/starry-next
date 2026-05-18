@@ -45,6 +45,7 @@ bitmap-allocator = { path = "vendor/bitmap-allocator" }
 flatten_objects = { path = "vendor/flatten_objects" }
 page_table_multiarch = { path = "vendor/page_table_multiarch" }
 page_table_entry = { path = "vendor/page_table_entry" }
+axfs_vfs = { path = "vendor/axfs_vfs" }
 axfs_ramfs = { path = "patches/axfs_ramfs" }
 memory_set = { path = "vendor/memory_set" }
 

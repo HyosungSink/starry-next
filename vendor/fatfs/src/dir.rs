@@ -136,9 +136,9 @@ impl<'a, IO: ReadWriteSeek, TP: TimeProvider, OCC: OemCpConverter> Dir<'a, IO, T
                 // check if file or directory is expected
                 if is_dir.is_some() && Some(e.is_dir()) != is_dir {
                     if e.is_dir() {
-                        error!("Is a directory");
+                        trace!("Is a directory");
                     } else {
-                        error!("Not a directory");
+                        trace!("Not a directory");
                     }
                     return Err(Error::InvalidInput);
                 }
