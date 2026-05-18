@@ -1,5 +1,8 @@
 use alloc::{boxed::Box, collections::VecDeque};
-use core::ops::{Deref, DerefMut};
+use core::{
+    mem,
+    ops::{Deref, DerefMut},
+};
 
 use axerrno::{AxError, AxResult, ax_err};
 use axsync::Mutex;
@@ -29,14 +32,6 @@ impl ListenTableEntry {
         match self.listen_endpoint.addr {
             Some(addr) => addr == dst,
             None => true,
-        }
-    }
-}
-
-impl Drop for ListenTableEntry {
-    fn drop(&mut self) {
-        for &handle in &self.syn_queue {
-            SOCKET_SET.remove(handle);
         }
     }
 }
@@ -75,7 +70,16 @@ impl ListenTable {
 
     pub fn unlisten(&self, port: u16) {
         debug!("TCP socket unlisten on {}", port);
-        *self.tcp[port as usize].lock() = None;
+        let pending = {
+            let mut entry = self.tcp[port as usize].lock();
+            entry
+                .take()
+                .map(|mut entry| mem::take(&mut entry.syn_queue))
+                .unwrap_or_default()
+        };
+        for handle in pending {
+            SOCKET_SET.remove(handle);
+        }
     }
 
     pub fn can_accept(&self, port: u16) -> AxResult<bool> {
