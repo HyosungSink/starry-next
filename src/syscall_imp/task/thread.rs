@@ -38,7 +38,7 @@ use crate::{
     syscall_body,
     task::{
         find_live_task_by_tid, find_process_leader_by_pid, find_zombie_process_by_pid,
-        process_leader_tasks, unregister_zombie_process, wait_child,
+        process_leader_tasks, thread_group_tasks, unregister_zombie_process, wait_child,
         wait_child_selector_from_waitpid, wait_child_status, wait_selector_matches_live,
         wait_status_continued, wait_status_stopped, WaitChildSelector, ZombieProcess,
     },
@@ -203,6 +203,28 @@ fn current_proc_identity() -> (u32, u32) {
         task.id().as_u64() as u32
     };
     (task.task_ext().proc_id as u32, tid)
+}
+
+fn task_visible_tid(task: &AxTaskRef) -> u64 {
+    if task.id().as_u64() == task.task_ext().leader_tid() {
+        task.task_ext().proc_id as u64
+    } else {
+        task.id().as_u64()
+    }
+}
+
+fn find_live_task_by_visible_tid(tid: u64) -> Option<AxTaskRef> {
+    for leader in process_leader_tasks() {
+        if task_visible_tid(&leader) == tid {
+            return Some(leader);
+        }
+        for task in thread_group_tasks(leader.task_ext().proc_id) {
+            if task_visible_tid(&task) == tid {
+                return Some(task);
+            }
+        }
+    }
+    None
 }
 
 fn resolve_capget_target(pid: i32) -> Result<u32, LinuxError> {
@@ -1548,9 +1570,10 @@ pub(crate) fn sys_kill(pid: i32, signum: i32) -> isize {
 
 pub(crate) fn sys_tgkill(tgid: i32, tid: i32, signum: i32) -> isize {
     syscall_body!(sys_tgkill, {
-        if tid <= 0 || signum < 0 {
+        if tid <= 0 {
             return Err(LinuxError::EINVAL);
         }
+        let signum = validate_kill_signum(signum)?;
 
         let curr = current();
         let current_tgid = curr.task_ext().proc_id as i32;
@@ -1558,46 +1581,55 @@ pub(crate) fn sys_tgkill(tgid: i32, tid: i32, signum: i32) -> isize {
             return Err(LinuxError::ESRCH);
         }
 
-        if tid == curr.id().as_u64() as i32 {
-            crate::signal::send_current_signal(signum as usize);
+        if tid as u64 == task_visible_tid(curr.as_task_ref()) {
+            if signum != 0 {
+                crate::signal::send_current_signal(signum);
+            }
             return Ok(0);
         }
 
-        let Some(task) = find_live_task_by_tid(tid as u64) else {
+        let Some(task) = find_live_task_by_visible_tid(tid as u64) else {
             return Err(LinuxError::ESRCH);
         };
         if tgid != 0 && task.task_ext().proc_id as i32 != tgid {
             return Err(LinuxError::ESRCH);
         }
-        send_tkill_signal_to_task(
-            &task,
-            signum as usize,
-            curr.task_ext().proc_id as i32,
-            axfs::api::current_uid(),
-        );
+        if signum != 0 {
+            send_tkill_signal_to_task(
+                &task,
+                signum,
+                curr.task_ext().proc_id as i32,
+                axfs::api::current_uid(),
+            );
+        }
         Ok(0)
     })
 }
 
 pub(crate) fn sys_tkill(tid: i32, signum: i32) -> isize {
     syscall_body!(sys_tkill, {
-        if tid <= 0 || signum < 0 {
+        if tid <= 0 {
             return Err(LinuxError::EINVAL);
         }
-        if tid == current().id().as_u64() as i32 {
-            crate::signal::send_current_signal(signum as usize);
+        let signum = validate_kill_signum(signum)?;
+        let curr = current();
+        if tid as u64 == task_visible_tid(curr.as_task_ref()) {
+            if signum != 0 {
+                crate::signal::send_current_signal(signum);
+            }
             return Ok(0);
         }
-        let curr = current();
-        let Some(task) = find_live_task_by_tid(tid as u64) else {
+        let Some(task) = find_live_task_by_visible_tid(tid as u64) else {
             return Err(LinuxError::ESRCH);
         };
-        send_tkill_signal_to_task(
-            &task,
-            signum as usize,
-            curr.task_ext().proc_id as i32,
-            axfs::api::current_uid(),
-        );
+        if signum != 0 {
+            send_tkill_signal_to_task(
+                &task,
+                signum,
+                curr.task_ext().proc_id as i32,
+                axfs::api::current_uid(),
+            );
+        }
         Ok(0)
     })
 }
@@ -2622,7 +2654,12 @@ fn read_exec_image_from_fd(fd: i32) -> Result<(String, Vec<u8>), LinuxError> {
         .into_any()
         .downcast::<api::File>()
         .map_err(|_| LinuxError::EACCES)?;
-    let size = file.inner().lock().get_attr().map_err(LinuxError::from)?.size() as usize;
+    let size = file
+        .inner()
+        .lock()
+        .get_attr()
+        .map_err(LinuxError::from)?
+        .size() as usize;
     if size > 64 * 1024 * 1024 {
         return Err(LinuxError::E2BIG);
     }
@@ -2670,16 +2707,14 @@ pub fn sys_execveat(
                     return Err(LinuxError::ENOTDIR);
                 }
             }
-            let resolved = crate::syscall_imp::handle_kernel_path(
-                dirfd as isize,
-                path_str.as_str(),
-                false,
-            )?;
+            let resolved =
+                crate::syscall_imp::handle_kernel_path(dirfd as isize, path_str.as_str(), false)?;
             (resolved.to_string(), None)
         };
         crate::syscall_imp::validate_path_components(path_owned.as_str())?;
         if flags & AT_SYMLINK_NOFOLLOW != 0 {
-            let attr = axfs::api::metadata_raw_nofollow(path_owned.as_str()).map_err(LinuxError::from)?;
+            let attr =
+                axfs::api::metadata_raw_nofollow(path_owned.as_str()).map_err(LinuxError::from)?;
             if attr.file_type().is_symlink() {
                 return Err(LinuxError::ELOOP);
             }
