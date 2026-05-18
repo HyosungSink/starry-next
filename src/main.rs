@@ -65,15 +65,96 @@ static COMPETITION_TOTAL_DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
 static COMPETITION_TOTAL_TIMED_OUT: AtomicU64 = AtomicU64::new(0);
 static LTP_DIAG_RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 static LTP_DIAG_DONE_SEQ: AtomicU64 = AtomicU64::new(0);
+static LTP_ACTIVE_CASE: Mutex<Option<String>> = Mutex::new(None);
+static LTP_ACTIVE_CASE_PGID: AtomicU64 = AtomicU64::new(0);
+static LTP_ACTIVE_CASE_DEADLINE_NS: AtomicU64 = AtomicU64::new(0);
 
 const SIGKILL_SIGNUM: usize = 9;
-const COMPETITION_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
+// Some LTP cases, notably fork13 and timerfd_settime02, may legally run for
+// minutes. Keep the total guard well above a complete libc matrix run; per-case
+// watchdogs still catch individual hangs.
+const COMPETITION_TOTAL_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
+const NETPERF_SCRIPT_SILENCE_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn script_silence_watchdog_timeout(script: &str) -> Option<Duration> {
+    match script_group_name(script) {
+        "netperf" => Some(NETPERF_SCRIPT_SILENCE_TIMEOUT),
+        _ => None,
+    }
+}
 
 fn arm_script_watchdog(script: &str) -> u64 {
     let token = COMPETITION_SCRIPT_WATCHDOG_TOKEN.fetch_add(1, Ordering::SeqCst) + 1;
     COMPETITION_SCRIPT_PROGRESS_NS.store(monotonic_time_nanos(), Ordering::SeqCst);
     COMPETITION_STDOUT_LINE_BUFFER.lock().clear();
     *COMPETITION_WATCHDOG_SCRIPT.lock() = Some(script.to_string());
+    if script_group_name(script) == "ltp" {
+        axtask::spawn_raw(
+            move || loop {
+                if COMPETITION_SCRIPT_WATCHDOG_TOKEN.load(Ordering::Acquire) != token {
+                    break;
+                }
+                let deadline_ns = LTP_ACTIVE_CASE_DEADLINE_NS.load(Ordering::Acquire);
+                let now_ns = monotonic_time_nanos();
+                if deadline_ns != 0 && now_ns >= deadline_ns {
+                    let pgid = LTP_ACTIVE_CASE_PGID.load(Ordering::Acquire);
+                    let case = LTP_ACTIVE_CASE
+                        .lock()
+                        .clone()
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    if pgid != 0 {
+                        // Move the deadline forward before killing so a stubborn task can be
+                        // retried without flooding the console.
+                        LTP_ACTIVE_CASE_DEADLINE_NS.store(
+                            now_ns.saturating_add(Duration::from_secs(5).as_nanos() as u64),
+                            Ordering::Release,
+                        );
+                        let killed =
+                            task::kill_current_competition_process_group(pgid, SIGKILL_SIGNUM);
+                        warn!(
+                            "[osk-ltp-diag] case={} phase=kernel-watchdog-timeout pgid={} killed_tasks={}",
+                            case, pgid, killed
+                        );
+                    }
+                }
+                axtask::sleep(Duration::from_millis(200));
+            },
+            "ltp-case-watchdog".into(),
+            WATCHDOG_STACK_SIZE,
+        );
+    }
+    if let Some(timeout) = script_silence_watchdog_timeout(script) {
+        let script_name = script.to_string();
+        axtask::spawn_raw(
+            move || {
+                let timeout_ns = timeout.as_nanos() as u64;
+                loop {
+                    if COMPETITION_SCRIPT_WATCHDOG_TOKEN.load(Ordering::Acquire) != token {
+                        break;
+                    }
+                    let progress_ns = COMPETITION_SCRIPT_PROGRESS_NS.load(Ordering::Acquire);
+                    if progress_ns != 0 {
+                        let now_ns = monotonic_time_nanos();
+                        let idle_ns = now_ns.saturating_sub(progress_ns);
+                        if idle_ns >= timeout_ns {
+                            COMPETITION_SCRIPT_PROGRESS_NS.store(now_ns, Ordering::Release);
+                            let killed = task::kill_current_competition_script_tree(SIGKILL_SIGNUM);
+                            warn!(
+                                "[online-diag] kind=script phase=silence-watchdog-timeout path={} idle_ms={} killed_tasks={}",
+                                script_name,
+                                idle_ns / 1_000_000,
+                                killed
+                            );
+                            break;
+                        }
+                    }
+                    axtask::sleep(Duration::from_millis(500));
+                }
+            },
+            "script-silence-watchdog".into(),
+            WATCHDOG_STACK_SIZE,
+        );
+    }
     token
 }
 
@@ -88,6 +169,9 @@ fn disarm_script_watchdog(token: u64) {
         COMPETITION_SCRIPT_PROGRESS_NS.store(0, Ordering::SeqCst);
         COMPETITION_STDOUT_LINE_BUFFER.lock().clear();
         *COMPETITION_WATCHDOG_SCRIPT.lock() = None;
+        *LTP_ACTIVE_CASE.lock() = None;
+        LTP_ACTIVE_CASE_PGID.store(0, Ordering::Release);
+        LTP_ACTIVE_CASE_DEADLINE_NS.store(0, Ordering::Release);
     }
 }
 
@@ -97,33 +181,39 @@ fn arm_total_competition_watchdog() -> u64 {
         monotonic_time_nanos().saturating_add(COMPETITION_TOTAL_TIMEOUT.as_nanos() as u64);
     COMPETITION_TOTAL_DEADLINE_NS.store(deadline_ns, Ordering::SeqCst);
     COMPETITION_TOTAL_TIMED_OUT.store(0, Ordering::SeqCst);
-    axtask::spawn_raw(move || loop {
-        if COMPETITION_TOTAL_WATCHDOG_TOKEN.load(Ordering::Acquire) != token {
-            break;
-        }
-        let now_ns = monotonic_time_nanos();
-        let deadline_ns = COMPETITION_TOTAL_DEADLINE_NS.load(Ordering::Acquire);
-        if deadline_ns != 0 && now_ns >= deadline_ns {
-            if COMPETITION_TOTAL_TIMED_OUT
-                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                warn!(
-                    "Competition total watchdog timeout: elapsed_s={} limit_s={} -> stopping online evaluation",
-                    now_ns.saturating_sub(deadline_ns.saturating_sub(COMPETITION_TOTAL_TIMEOUT.as_nanos() as u64)) / 1_000_000_000,
-                    COMPETITION_TOTAL_TIMEOUT.as_secs()
-                );
-                let killed = task::kill_current_competition_script_tree(SIGKILL_SIGNUM);
-                warn!(
-                    "Competition total watchdog cleanup complete: killed_tasks={} limit_s={}",
-                    killed,
-                    COMPETITION_TOTAL_TIMEOUT.as_secs()
-                );
+    axtask::spawn_raw(
+        move || loop {
+            if COMPETITION_TOTAL_WATCHDOG_TOKEN.load(Ordering::Acquire) != token {
+                break;
             }
-            break;
-        }
-        axtask::sleep(Duration::from_millis(200));
-    }, "competition-watchdog".into(), WATCHDOG_STACK_SIZE);
+            let now_ns = monotonic_time_nanos();
+            let deadline_ns = COMPETITION_TOTAL_DEADLINE_NS.load(Ordering::Acquire);
+            if deadline_ns != 0 && now_ns >= deadline_ns {
+                if COMPETITION_TOTAL_TIMED_OUT
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    warn!(
+                        "Competition total watchdog timeout: elapsed_s={} limit_s={} -> stopping online evaluation",
+                        now_ns.saturating_sub(
+                            deadline_ns.saturating_sub(COMPETITION_TOTAL_TIMEOUT.as_nanos() as u64)
+                        ) / 1_000_000_000,
+                        COMPETITION_TOTAL_TIMEOUT.as_secs()
+                    );
+                    let killed = task::kill_current_competition_script_tree(SIGKILL_SIGNUM);
+                    warn!(
+                        "Competition total watchdog cleanup complete: killed_tasks={} limit_s={}",
+                        killed,
+                        COMPETITION_TOTAL_TIMEOUT.as_secs()
+                    );
+                }
+                break;
+            }
+            axtask::sleep(Duration::from_millis(200));
+        },
+        "competition-watchdog".into(),
+        WATCHDOG_STACK_SIZE,
+    );
     token
 }
 
@@ -256,6 +346,48 @@ fn parse_ltp_case_timestamp_event(line: &str) -> Option<(&str, &'static str)> {
     None
 }
 
+fn parse_osk_ltp_case_started(line: &str) -> Option<(&str, u64)> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("[osk-ltp-diag] ")?;
+    let mut case_name = None;
+    let mut pid = None;
+    let mut started = false;
+    for part in rest.split_whitespace() {
+        if let Some(value) = part.strip_prefix("case=") {
+            case_name = Some(value);
+        } else if let Some(value) = part.strip_prefix("pid=") {
+            pid = value.parse::<u64>().ok();
+        } else if part == "phase=started" {
+            started = true;
+        }
+    }
+    match (case_name, pid, started) {
+        (Some(case_name), Some(pid), true) if !case_name.is_empty() && pid != 0 => {
+            Some((case_name, pid))
+        }
+        _ => None,
+    }
+}
+
+fn ltp_case_watchdog_timeout(case_name: &str) -> Duration {
+    match case_name {
+        "fork13" => Duration::from_secs(750),
+        "timerfd_settime02" => Duration::from_secs(240),
+        _ => Duration::from_secs(180),
+    }
+}
+
+fn note_ltp_case_started(line: &str) {
+    let Some((case_name, pgid)) = parse_osk_ltp_case_started(line) else {
+        return;
+    };
+    let deadline_ns = monotonic_time_nanos()
+        .saturating_add(ltp_case_watchdog_timeout(case_name).as_nanos() as u64);
+    *LTP_ACTIVE_CASE.lock() = Some(case_name.to_string());
+    LTP_ACTIVE_CASE_PGID.store(pgid, Ordering::Release);
+    LTP_ACTIVE_CASE_DEADLINE_NS.store(deadline_ns, Ordering::Release);
+}
+
 fn ltp_case_needs_online_diag(case_name: &str, phase: &str, seq: u64) -> bool {
     seq <= 8
         || seq % 25 == 0
@@ -273,12 +405,32 @@ fn ltp_case_needs_online_diag(case_name: &str, phase: &str, seq: u64) -> bool {
 fn emit_online_task_memory_diag(kind: &str, phase: &str, name: &str, seq: u64) {
     let allocator = global_allocator();
     let counts = task::diagnostic_task_counts();
+    let frame_refs = axmm::frame_ref_stats();
+    let mounts = axfs::api::diagnostic_mount_stats();
+    let ramfs = axfs::api::diagnostic_ramfs_quota_stats();
+    let loopdev = arceos_posix_api::diagnostic_loop_device_state();
+    let tmpfiles = arceos_posix_api::diagnostic_named_tmpfiles();
     println!(
-        "[online-diag] kind={kind} phase={phase} name={name} seq={seq} now_ms={} available_pages={} used_bytes={} available_bytes={} live_tasks={} live_exited_tasks={} process_leaders={} zombie_processes={} script_tagged_tasks={} script_tagged_exited_tasks={}",
+        "[online-diag] kind={kind} phase={phase} name={name} seq={seq} now_ms={} available_pages={} used_pages={} used_bytes={} available_bytes={} frame_refs={} frame_ref_total={} frame_ref_max={} mounts_total={} mounts_ext4={} mounts_ramfs={} ramfs_live={} ramfs_used_bytes={} ramfs_max_bytes={} loop_backing={} loop_configured={} loop_size={} named_tmpfiles={} named_tmpfile_bytes={} live_tasks={} live_exited_tasks={} process_leaders={} zombie_processes={} script_tagged_tasks={} script_tagged_exited_tasks={}",
         monotonic_time_nanos() / 1_000_000,
         allocator.available_pages(),
+        allocator.used_pages(),
         allocator.used_bytes(),
         allocator.available_bytes(),
+        frame_refs.tracked_frames,
+        frame_refs.total_refs,
+        frame_refs.max_refcount,
+        mounts.total,
+        mounts.ext4,
+        mounts.ramfs,
+        ramfs.live_filesystems,
+        ramfs.used_bytes,
+        ramfs.max_bytes,
+        loopdev.has_backing,
+        loopdev.configured,
+        loopdev.visible_size,
+        tmpfiles.entries,
+        tmpfiles.allocated_bytes,
         counts.live_tasks,
         counts.live_exited_tasks,
         counts.process_leaders,
@@ -300,7 +452,21 @@ fn emit_kernel_ltp_case_timestamp(line: &str) {
         "run" => LTP_DIAG_RUN_SEQ.fetch_add(1, Ordering::SeqCst) + 1,
         _ => LTP_DIAG_DONE_SEQ.fetch_add(1, Ordering::SeqCst) + 1,
     };
+    if phase == "run" {
+        *LTP_ACTIVE_CASE.lock() = Some(case_name.to_string());
+        LTP_ACTIVE_CASE_PGID.store(0, Ordering::Release);
+        LTP_ACTIVE_CASE_DEADLINE_NS.store(0, Ordering::Release);
+    }
     if phase == "done" {
+        let should_clear = LTP_ACTIVE_CASE
+            .lock()
+            .as_ref()
+            .is_some_and(|active| active == case_name);
+        if should_clear {
+            *LTP_ACTIVE_CASE.lock() = None;
+            LTP_ACTIVE_CASE_PGID.store(0, Ordering::Release);
+            LTP_ACTIVE_CASE_DEADLINE_NS.store(0, Ordering::Release);
+        }
         task::reclaim_runtime_memory_detail("ltp_case_done");
     }
     if ltp_case_needs_online_diag(case_name, phase, seq) {
@@ -330,6 +496,7 @@ pub(crate) fn note_competition_output_activity(fd: i32, bytes: &[u8]) {
                 let line = mem::take(&mut *buffer);
                 let line = line.trim_end_matches('\r');
                 if script_group_name(active_script.as_str()) == "ltp" {
+                    note_ltp_case_started(line);
                     emit_kernel_ltp_case_timestamp(line);
                 }
                 if line_counts_as_script_progress(active_script.as_str(), line) {
@@ -506,7 +673,10 @@ export PATH
 export LTPROOT="$ltp_root"
 export LIBRARY_PATH="{runtime_library_path}"
 export LD_LIBRARY_PATH="{runtime_library_path}"
-: "${{LTP_TIMEOUT_MUL:=10000}}"
+# Keep LTP's per-case max_runtime meaningful. Long cases such as fork13 carry
+# their own larger limits; short cases should still time out instead of blocking
+# the whole syscall suite.
+: "${{LTP_TIMEOUT_MUL:=1}}"
 export LTP_TIMEOUT_MUL
 : "${{LTP_RUNTIME_MUL:=1}}"
 export LTP_RUNTIME_MUL
@@ -661,7 +831,7 @@ run_ltp_case() {{
   local case_name="$1"
   shift
   local log_file="/tmp/.ltp_${{case_name}}_$$.log"
-  local case_pid ret log_bytes
+  local case_pid ret log_bytes watchdog_pid case_timeout watchdog_file
   : > "$log_file"
 
   kill_case_session() {{
@@ -671,9 +841,41 @@ run_ltp_case() {{
 
   (cd "$target_dir" && /busybox setsid "$@") >"$log_file" 2>&1 &
   case_pid=$!
+  watchdog_file="/tmp/.ltp_watchdog_${{case_name}}_${{case_pid}}"
+  echo "$case_pid" > "$watchdog_file"
   echo "[osk-ltp-diag] case=$case_name pid=$case_pid phase=started"
+  case_timeout="$LTP_CASE_TIMEOUT_SECONDS"
+  if [ -z "$case_timeout" ]; then
+    case_timeout=180
+  fi
+  case "$case_name" in
+    fork13)
+      case_timeout=750
+      ;;
+    timerfd_settime02)
+      case_timeout=240
+      ;;
+  esac
+  /busybox setsid /busybox sh -c '
+    timeout="$1"
+    pid="$2"
+    name="$3"
+    marker="$4"
+    /busybox sleep "$timeout"
+    if [ -f "$marker" ] && [ "$(/busybox cat "$marker" 2>/dev/null)" = "$pid" ] && /busybox kill -0 "$pid" 2>/dev/null; then
+      echo "[osk-ltp-diag] case=$name phase=watchdog-timeout seconds=$timeout"
+      /busybox kill -TERM "-$pid" 2>/dev/null || /busybox kill -TERM "$pid" 2>/dev/null || true
+      /busybox sleep 1
+      /busybox kill -KILL "-$pid" 2>/dev/null || /busybox kill -KILL "$pid" 2>/dev/null || true
+    fi
+  ' ltp-case-watchdog "$case_timeout" "$case_pid" "$case_name" "$watchdog_file" &
+  watchdog_pid=$!
   wait "$case_pid"
   ret=$?
+  /busybox rm -f "$watchdog_file"
+  /busybox kill -TERM "-$watchdog_pid" 2>/dev/null || /busybox kill "$watchdog_pid" 2>/dev/null || true
+  /busybox kill -KILL "-$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
   log_bytes=$(/busybox wc -c < "$log_file" 2>/dev/null || echo -1)
   echo "[osk-ltp-diag] case=$case_name phase=wait-done ret=$ret log_bytes=$log_bytes"
   kill_case_session TERM
@@ -689,19 +891,37 @@ run_ltp_case() {{
       failed*)
         if [ "$in_summary" -eq 1 ]; then
           set -- $line
-          failed=$(ltp_failure_count_value "${{2:-0}}")
+          failed="${{2:-0}}"
+          case "$failed" in
+            ""|*[!0-9]*) failed=0 ;;
+          esac
+          if [ "$failed" -gt 10000 ] 2>/dev/null; then
+            failed=1
+          fi
         fi
         ;;
       broken*)
         if [ "$in_summary" -eq 1 ]; then
           set -- $line
-          broken=$(ltp_failure_count_value "${{2:-0}}")
+          broken="${{2:-0}}"
+          case "$broken" in
+            ""|*[!0-9]*) broken=0 ;;
+          esac
+          if [ "$broken" -gt 10000 ] 2>/dev/null; then
+            broken=1
+          fi
         fi
         ;;
       skipped*)
         if [ "$in_summary" -eq 1 ]; then
           set -- $line
-          skipped=$(ltp_count_value "${{2:-0}}")
+          skipped="${{2:-0}}"
+          case "$skipped" in
+            ""|*[!0-9]*) skipped=0 ;;
+          esac
+          if [ "$skipped" -gt 10000 ] 2>/dev/null; then
+            skipped=0
+          fi
         fi
         ;;
     esac
@@ -716,6 +936,8 @@ run_ltp_case() {{
   else
     echo "FAIL LTP CASE $case_name : $ret"
   fi
+  /busybox rm -f "$log_file"
+  /busybox rm -f "$watchdog_file"
 }}
 
 while IFS= read -r line; do
@@ -728,14 +950,6 @@ while IFS= read -r line; do
   shift
 
   echo "RUN LTP CASE $name"
-  case "$name" in
-    fallocate05|fallocate06)
-      echo "[osk-ltp-diag] case=$name phase=skip reason=resource-pressure"
-      echo "SKIP LTP CASE $name : 0"
-      echo "FAIL LTP CASE $name : 0"
-      continue
-      ;;
-  esac
   run_ltp_case "$name" "$@"
 done < {runtest_path}
 exit 0
@@ -748,7 +962,10 @@ exit 0
             "#!/busybox sh\n/busybox echo \"#### OS COMP TEST GROUP START {marker} ####\"\n/busybox sh {generated_raw_path}\nstatus=$?\n/busybox echo \"#### OS COMP TEST GROUP END {marker} ####\"\nexit $status\n"
         );
         overwrite_script(generated_raw_path.as_str(), raw_script.as_str());
-        overwrite_script(generated_wrapper_path.as_str(), generated_wrapper_script.as_str());
+        overwrite_script(
+            generated_wrapper_path.as_str(),
+            generated_wrapper_script.as_str(),
+        );
         overwrite_script(raw_path.as_str(), raw_script.as_str());
         overwrite_script(wrapper_path.as_str(), wrapper_script.as_str());
     }
@@ -1363,7 +1580,10 @@ fn discover_test_scripts() -> Option<Vec<String>> {
     let mut found_groups = [false; CONTEST_GROUPS.len()];
     let start_index = contest_schedule_start_index();
     let start_group = CONTEST_GROUPS.get(start_index).copied().unwrap_or("ltp");
-    warn!("Contest scheduler starts from contest group: {}", start_group);
+    warn!(
+        "Contest scheduler starts from contest group: {}",
+        start_group
+    );
     for dir in RUNTIME_SCRIPT_DIRS {
         let runtime = runtime_name(dir);
         for (group_index, group) in CONTEST_GROUPS.iter().enumerate().skip(start_index) {
@@ -1372,22 +1592,19 @@ fn discover_test_scripts() -> Option<Vec<String>> {
                 continue;
             }
             let generated_path = generated_group_script_path(dir, group);
-            let path = if group == &"ltp" && axfs::api::absolute_path_exists(generated_path.as_str()) {
-                generated_path
-            } else {
-                group_script_path(dir, group)
-            };
+            let path =
+                if group == &"ltp" && axfs::api::absolute_path_exists(generated_path.as_str()) {
+                    generated_path
+                } else {
+                    group_script_path(dir, group)
+                };
             if has_script_path(path.as_str()) {
                 ordered.push(path);
                 found_groups[group_index] = true;
             }
         }
     }
-    for (group_index, group) in CONTEST_GROUPS
-        .iter()
-        .enumerate()
-        .skip(start_index)
-    {
+    for (group_index, group) in CONTEST_GROUPS.iter().enumerate().skip(start_index) {
         if !should_schedule_group_any_runtime(group) {
             continue;
         }
