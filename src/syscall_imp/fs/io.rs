@@ -2,6 +2,7 @@ use alloc::{
     ffi::CString,
     format,
     string::{String, ToString},
+    sync::Arc,
     vec,
     vec::Vec,
 };
@@ -14,9 +15,9 @@ use core::{
 use arceos_posix_api::{self as api, ctypes::mode_t, get_file_like};
 use axerrno::LinuxError;
 use axhal::{mem::VirtAddr, paging::MappingFlags};
-use axtask::{current, TaskExtRef};
 use axstd::io::SeekFrom;
-use core::sync::atomic::{AtomicBool, Ordering};
+use axtask::{current, TaskExtRef};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use memory_addr::PAGE_SIZE_4K;
 
 use super::{
@@ -32,11 +33,21 @@ use crate::usercopy::{
 };
 
 static LIBCBENCH_TMP_OPEN_LOGGED: AtomicBool = AtomicBool::new(false);
+static FILE_IO_FAIRNESS_TICKS: AtomicUsize = AtomicUsize::new(0);
 const O_PATH: i32 = 0o10000000;
 const AT_EACCESS: i32 = 0x200;
 const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 const AT_EMPTY_PATH: i32 = 0x1000;
 const SEEK_CUR: i32 = 1;
+
+fn maybe_yield_after_write_syscall(bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    if FILE_IO_FAIRNESS_TICKS.fetch_add(1, Ordering::Relaxed) % 256 == 255 {
+        axtask::yield_now();
+    }
+}
 const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
 const S_IFBLK: u32 = 0o060000;
@@ -56,6 +67,21 @@ const POSIX_FADV_DONTNEED: i32 = 4;
 const POSIX_FADV_NOREUSE: i32 = 5;
 const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
 const FS_APPEND_FL: u32 = 0x0000_0020;
+
+fn invalidate_exec_cache_for_file_like(file: &Arc<dyn api::FileLike>) {
+    if let Ok(file) = file.clone().into_any().downcast::<api::File>() {
+        crate::mm::invalidate_exec_cache_path(file.path());
+        crate::syscall_imp::invalidate_shared_file_mapping_cache_path(file.path());
+    }
+}
+
+fn regular_file_mount_kind(file: &Arc<dyn api::FileLike>) -> Option<axfs::api::PathMountKind> {
+    file.clone()
+        .into_any()
+        .downcast::<api::File>()
+        .ok()
+        .map(|file| axfs::api::path_mount_kind(file.path()))
+}
 
 fn validate_vectored_io(iov: *const api::ctypes::iovec, iocnt: i32) -> Result<(), LinuxError> {
     if iocnt < 0 {
@@ -404,6 +430,9 @@ pub(crate) fn sys_pwrite64(
                 break;
             }
         }
+        if total > 0 {
+            invalidate_exec_cache_for_file_like(&file);
+        }
         Ok(total)
     })
 }
@@ -518,11 +547,15 @@ pub(crate) fn sys_write(fd: i32, buf: *const c_void, count: usize) -> isize {
                 break;
             }
         }
+        if total > 0 {
+            invalidate_exec_cache_for_file_like(&file);
+        }
         Ok(total)
     });
     if ret == -(LinuxError::EPIPE.code() as isize) {
         crate::signal::send_current_signal(13);
     } else if ret > 0 {
+        maybe_yield_after_write_syscall(ret as usize);
         notify_fd_write_event(fd);
         for chunk in &progress_chunks {
             crate::note_competition_output_activity(fd, chunk);
@@ -563,6 +596,9 @@ pub(crate) fn sys_writev(fd: i32, iov: *const api::ctypes::iovec, iocnt: i32) ->
             if iov_total < iov_ref.iov_len {
                 break;
             }
+        }
+        if total > 0 {
+            invalidate_exec_cache_for_file_like(&file);
         }
         Ok(total)
     })
@@ -609,6 +645,9 @@ pub(crate) fn sys_pwritev(
             if iov_total < iov_ref.iov_len {
                 break;
             }
+        }
+        if total > 0 {
+            invalidate_exec_cache_for_file_like(&file);
         }
         Ok(total)
     })
@@ -699,6 +738,14 @@ pub(crate) fn sys_copy_file_range(
         if output.status_flags() & (api::ctypes::O_APPEND as usize) != 0 {
             return Err(LinuxError::EBADF);
         }
+        if let (Some(input_kind), Some(output_kind)) = (
+            regular_file_mount_kind(&input),
+            regular_file_mount_kind(&output),
+        ) {
+            if input_kind != output_kind {
+                return Err(LinuxError::EXDEV);
+            }
+        }
 
         let in_pos = if off_in.is_null() {
             input.seek(SeekFrom::Current(0))?
@@ -756,12 +803,20 @@ pub(crate) fn sys_copy_file_range(
         let mut output_offset = out_pos;
         let mut copied = 0usize;
         let mut remaining = len;
+        let input_size = u64::try_from(input_stat.st_size).unwrap_or(0);
         let mut buf = vec![0u8; len.min(PAGE_SIZE_4K).max(1)];
 
         while remaining > 0 {
             let chunk = remaining.min(buf.len());
             let read_len = input.read_at(input_offset, &mut buf[..chunk])?;
             if read_len == 0 {
+                if copied == 0 && input_offset < input_size {
+                    warn!(
+                        "copy_file_range made no progress before EOF: fd_in={} fd_out={} off_in={} off_out={} len={} input_size={}",
+                        fd_in, fd_out, input_offset, output_offset, len, input_size
+                    );
+                    return Err(LinuxError::EIO);
+                }
                 break;
             }
 
@@ -810,6 +865,7 @@ pub(crate) fn sys_copy_file_range(
             tv_nsec: now_ns % 1_000_000_000,
         };
         if copied > 0 {
+            invalidate_exec_cache_for_file_like(&output);
             api::set_file_times(fd_out, now, now)?;
         }
         Ok(copied)
@@ -1220,6 +1276,9 @@ pub(crate) fn sys_splice(
         }
         if let Some(offset) = output_offset {
             write_value_to_user(off_out, offset as api::ctypes::off_t)?;
+        }
+        if copied > 0 {
+            invalidate_exec_cache_for_file_like(&output);
         }
         Ok(copied)
     })
