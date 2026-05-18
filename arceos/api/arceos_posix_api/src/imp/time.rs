@@ -60,6 +60,13 @@ impl From<Duration> for ctypes::timeval {
     }
 }
 
+fn timespec_to_duration(ts: ctypes::timespec) -> Result<Duration, LinuxError> {
+    if ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1_000_000_000 {
+        return Err(LinuxError::EINVAL);
+    }
+    Ok(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
 /// Get clock time since booting
 pub unsafe fn sys_clock_gettime(clk: ctypes::clockid_t, ts: *mut ctypes::timespec) -> c_int {
     syscall_body!(sys_clock_gettime, {
@@ -111,16 +118,16 @@ pub unsafe fn sys_clock_getres(clk: ctypes::clockid_t, ts: *mut ctypes::timespec
 /// TODO: should be woken by signals, and set errno
 pub unsafe fn sys_nanosleep(req: *const ctypes::timespec, rem: *mut ctypes::timespec) -> c_int {
     syscall_body!(sys_nanosleep, {
-        unsafe {
-            if req.is_null() || (*req).tv_nsec < 0 || (*req).tv_nsec > 999999999 {
-                return Err(LinuxError::EINVAL);
-            }
+        if req.is_null() {
+            return Err(LinuxError::EFAULT);
         }
 
-        let dur = unsafe {
-            debug!("sys_nanosleep <= {}.{:09}s", (*req).tv_sec, (*req).tv_nsec);
-            Duration::from(*req)
-        };
+        let req_local = unsafe { *req };
+        debug!(
+            "sys_nanosleep <= {}.{:09}s",
+            req_local.tv_sec, req_local.tv_nsec
+        );
+        let dur = timespec_to_duration(req_local)?;
 
         let now = axhal::time::monotonic_time();
 

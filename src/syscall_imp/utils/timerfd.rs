@@ -13,8 +13,7 @@ use axtask::WaitQueue;
 use crate::{
     syscall_body,
     timekeeping::{
-        current_realtime_nanos, monotonic_deadline_from_clock, nanos_to_timespec,
-        timespec_to_nanos,
+        current_realtime_nanos, monotonic_deadline_from_clock, nanos_to_timespec, timespec_to_nanos,
     },
     usercopy::{read_value_from_user, write_value_to_user},
 };

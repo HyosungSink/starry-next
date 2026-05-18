@@ -281,7 +281,10 @@ pub fn yield_now() {
 ///
 /// If the feature `irq` is not enabled, it uses busy-wait instead.
 pub fn sleep(dur: core::time::Duration) {
-    sleep_until(axhal::time::wall_time() + dur);
+    let deadline = axhal::time::wall_time()
+        .checked_add(dur)
+        .unwrap_or(core::time::Duration::MAX);
+    sleep_until(deadline);
 }
 
 /// Current task is going to sleep, it will be woken up at the given deadline.
