@@ -79,6 +79,7 @@ pub(crate) struct RuntimeReclaimStats {
     pub exited_tasks: usize,
     pub stack_pages: usize,
     pub exec_cache_pages: usize,
+    pub shared_file_mapping_pages: usize,
     pub fs_cache_entries: usize,
 }
 
@@ -153,8 +154,7 @@ fn exec_failure_bucket(path: &str) -> (&'static str, &'static AtomicUsize, &'sta
 pub(crate) fn log_user_program_load_failure(path: &str, err: &AxError) {
     if matches!(err, AxError::NoMemory) {
         let (kind, counter, _) = exec_failure_bucket(path);
-        if let Some(count) = repeated_log_sample(counter, REPEATED_LOG_BURST, REPEATED_LOG_PERIOD)
-        {
+        if let Some(count) = repeated_log_sample(counter, REPEATED_LOG_BURST, REPEATED_LOG_PERIOD) {
             error!(
                 "Failed to load app {}: {:?} [sampled kind={} count={}]",
                 path, err, kind, count
@@ -168,8 +168,7 @@ pub(crate) fn log_user_program_load_failure(path: &str, err: &AxError) {
 pub(crate) fn log_exec_failure(path: &str, err: &AxError) {
     if matches!(err, AxError::NoMemory) {
         let (kind, _, counter) = exec_failure_bucket(path);
-        if let Some(count) = repeated_log_sample(counter, EXEC_OOM_LOG_BURST, EXEC_OOM_LOG_PERIOD)
-        {
+        if let Some(count) = repeated_log_sample(counter, EXEC_OOM_LOG_BURST, EXEC_OOM_LOG_PERIOD) {
             error!(
                 "Failed to exec path={} err={:?} [sampled kind={} count={}]",
                 path, err, kind, count
@@ -192,7 +191,8 @@ fn allocate_process_id() -> usize {
         } else {
             candidate + 1
         };
-        if !leaders.contains_key(&(candidate as u64)) && !zombies.contains_key(&(candidate as u64)) {
+        if !leaders.contains_key(&(candidate as u64)) && !zombies.contains_key(&(candidate as u64))
+        {
             NEXT_PROCESS_ID.store(candidate as u64, Ordering::Relaxed);
             return candidate;
         }
@@ -247,20 +247,23 @@ pub(crate) fn reclaim_runtime_memory_detail(reason: &str) -> RuntimeReclaimStats
         exited_tasks: axtask::reclaim_exited_tasks(usize::MAX),
         stack_pages: axtask::reclaim_task_stack_cache(0),
         exec_cache_pages: crate::mm::reclaim_exec_caches(),
+        shared_file_mapping_pages: crate::syscall_imp::reclaim_shared_file_mapping_cache(),
         fs_cache_entries: axfs::api::reclaim_caches(),
     };
     if (stats.exited_tasks > 0
         || stats.stack_pages > 0
         || stats.exec_cache_pages > 0
+        || stats.shared_file_mapping_pages > 0
         || stats.fs_cache_entries > 0)
         && should_log_runtime_reclaim()
     {
         warn!(
-            "runtime reclaim reason={} reclaimed_exited_tasks={} reclaimed_stack_pages={} reclaimed_exec_cache_pages={} reclaimed_fs_cache_entries={}",
+            "runtime reclaim reason={} reclaimed_exited_tasks={} reclaimed_stack_pages={} reclaimed_exec_cache_pages={} reclaimed_shared_file_mapping_pages={} reclaimed_fs_cache_entries={}",
             reason,
             stats.exited_tasks,
             stats.stack_pages,
             stats.exec_cache_pages,
+            stats.shared_file_mapping_pages,
             stats.fs_cache_entries
         );
     }
@@ -315,10 +318,15 @@ pub(crate) fn prepare_runtime_for_exec(reason: &str, path: &str) {
         crate::mm::invalidate_exec_cache_path(path);
         let retry = reclaim_runtime_memory_detail("exec_prepare_retry");
         reclaimed.stack_pages = reclaimed.stack_pages.saturating_add(retry.stack_pages);
-        reclaimed.exec_cache_pages =
-            reclaimed.exec_cache_pages.saturating_add(retry.exec_cache_pages);
-        reclaimed.fs_cache_entries =
-            reclaimed.fs_cache_entries.saturating_add(retry.fs_cache_entries);
+        reclaimed.exec_cache_pages = reclaimed
+            .exec_cache_pages
+            .saturating_add(retry.exec_cache_pages);
+        reclaimed.shared_file_mapping_pages = reclaimed
+            .shared_file_mapping_pages
+            .saturating_add(retry.shared_file_mapping_pages);
+        reclaimed.fs_cache_entries = reclaimed
+            .fs_cache_entries
+            .saturating_add(retry.fs_cache_entries);
         available_after = global_allocator().available_pages();
     }
 
@@ -326,10 +334,11 @@ pub(crate) fn prepare_runtime_for_exec(reason: &str, path: &str) {
         && (low_memory
             || reclaimed.stack_pages > 0
             || reclaimed.exec_cache_pages > 0
+            || reclaimed.shared_file_mapping_pages > 0
             || reclaimed.fs_cache_entries > 0)
     {
         warn!(
-            "exec prepare reason={} path={} available_pages={} -> {} low_watermark={} reclaimed_stack_pages={} reclaimed_exec_cache_pages={} reclaimed_fs_cache_entries={}",
+            "exec prepare reason={} path={} available_pages={} -> {} low_watermark={} reclaimed_stack_pages={} reclaimed_exec_cache_pages={} reclaimed_shared_file_mapping_pages={} reclaimed_fs_cache_entries={}",
             reason,
             path,
             available_before,
@@ -337,13 +346,16 @@ pub(crate) fn prepare_runtime_for_exec(reason: &str, path: &str) {
             low_watermark,
             reclaimed.stack_pages,
             reclaimed.exec_cache_pages,
+            reclaimed.shared_file_mapping_pages,
             reclaimed.fs_cache_entries
         );
     }
 }
 
 fn exec_low_memory_deny_threshold_pages() -> usize {
-    runtime_reclaim_low_watermark_pages().saturating_mul(2)
+    runtime_reclaim_low_watermark_pages()
+        .saturating_div(2)
+        .max(2048)
 }
 
 fn should_reject_exec_for_low_memory(path: &str) -> bool {
@@ -374,6 +386,9 @@ fn should_reject_exec_for_low_memory(path: &str) -> bool {
     reclaimed.exec_cache_pages = reclaimed
         .exec_cache_pages
         .saturating_add(retry.exec_cache_pages);
+    reclaimed.shared_file_mapping_pages = reclaimed
+        .shared_file_mapping_pages
+        .saturating_add(retry.shared_file_mapping_pages);
     reclaimed.fs_cache_entries = reclaimed
         .fs_cache_entries
         .saturating_add(retry.fs_cache_entries);
@@ -589,26 +604,23 @@ fn should_log_private_fork_pressure() -> bool {
     slot <= 8 || slot.is_power_of_two()
 }
 
-fn should_reject_private_fork_for_low_memory(
-    clone_flags: CloneFlags,
-    aspace: &AddrSpace,
-) -> bool {
+fn should_reject_private_fork_for_low_memory(clone_flags: CloneFlags, aspace: &AddrSpace) -> bool {
     if clone_flags.contains(CloneFlags::CLONE_VM) || clone_flags.contains(CloneFlags::CLONE_VFORK) {
         return false;
     }
 
     let reserve_pages = private_fork_low_memory_reserve_pages(aspace);
-    let deny_reserve_pages = reserve_pages.saturating_div(5).max(24);
+    let deny_reserve_pages = reserve_pages.max(128);
     let mut available_pages = global_allocator().available_pages();
     let low_watermark = runtime_reclaim_low_watermark_pages();
-    let reclaim_threshold = reserve_pages.saturating_mul(4).clamp(128, low_watermark.max(128));
+    let reclaim_threshold = reserve_pages
+        .saturating_mul(4)
+        .clamp(128, low_watermark.max(128));
     if available_pages <= reclaim_threshold {
         let stats = reclaim_runtime_memory_detail("private_fork_prepare");
         available_pages = global_allocator().available_pages();
         if available_pages > reclaim_threshold
-            && (stats.stack_pages > 0
-                || stats.exec_cache_pages > 0
-                || stats.fs_cache_entries > 0)
+            && (stats.stack_pages > 0 || stats.exec_cache_pages > 0 || stats.fs_cache_entries > 0)
         {
             debug!(
                 "private fork reclaimed before clone: available_pages={} reclaim_threshold={} reserve_pages={} reclaimed_stack_pages={} reclaimed_exec_cache_pages={} reclaimed_fs_cache_entries={}",
@@ -786,8 +798,7 @@ pub(crate) fn is_path_open_for_write(path: &str) -> bool {
                 let access = flags & 0b11;
                 let write_like = access != arceos_posix_api::ctypes::O_RDONLY
                     || (flags
-                        & (arceos_posix_api::ctypes::O_TRUNC
-                            | arceos_posix_api::ctypes::O_APPEND))
+                        & (arceos_posix_api::ctypes::O_TRUNC | arceos_posix_api::ctypes::O_APPEND))
                         != 0;
                 if !write_like {
                     continue;
@@ -795,8 +806,8 @@ pub(crate) fn is_path_open_for_write(path: &str) -> bool {
                 let Ok(file) = file.clone().into_any().downcast::<arceos_posix_api::File>() else {
                     continue;
                 };
-                let canonical_file =
-                    axfs::api::canonicalize(file.path()).unwrap_or_else(|_| file.path().to_string());
+                let canonical_file = axfs::api::canonicalize(file.path())
+                    .unwrap_or_else(|_| file.path().to_string());
                 if canonical_file == canonical_target {
                     in_use = true;
                     break;
@@ -918,7 +929,8 @@ fn collect_live_tasks_with_script_tag(tag: u64, tasks: &mut Vec<AxTaskRef>) {
 }
 
 fn tagged_tasks_all_exited(tasks: &[AxTaskRef]) -> bool {
-    tasks.iter()
+    tasks
+        .iter()
         .all(|task| task.state() == axtask::TaskState::Exited)
 }
 
@@ -1002,6 +1014,65 @@ fn kill_competition_script_tree_with_tag(expected_tag: Option<u64>, signum: usiz
 
 pub(crate) fn kill_current_competition_script_tree(signum: usize) -> usize {
     kill_competition_script_tree_with_tag(None, signum)
+}
+
+pub(crate) fn kill_current_competition_process_group(process_group: u64, signum: usize) -> usize {
+    let root = {
+        let guard = competition_script_root().lock();
+        guard.clone()
+    };
+    let Some(root) = root else {
+        return 0;
+    };
+    let tag = root.task_ext().competition_script_tag();
+    if tag == 0 {
+        return 0;
+    }
+
+    let mut tasks = Vec::new();
+    let mut stale = Vec::new();
+    {
+        let live = live_tasks().lock();
+        for (tid, task) in live.iter() {
+            let Some(task) = task.upgrade() else {
+                stale.push(*tid);
+                continue;
+            };
+            if task.task_ext().competition_script_tag() == tag
+                && task.task_ext().process_group() == process_group
+            {
+                tasks.push(task);
+            }
+        }
+    }
+    if !stale.is_empty() {
+        let mut live = live_tasks().lock();
+        for tid in stale {
+            live.remove(&tid);
+        }
+    }
+
+    if let Some(curr) = axtask::current_may_uninit() {
+        let curr_tid = curr.id().as_u64();
+        tasks.retain(|task| task.id().as_u64() != curr_tid);
+    }
+    for task in &tasks {
+        if task.state() != axtask::TaskState::Exited {
+            crate::signal::send_signal_to_task(task, signum);
+        }
+    }
+    for _ in 0..64 {
+        if tagged_tasks_all_exited(&tasks) {
+            break;
+        }
+        axtask::yield_now();
+    }
+    for task in &tasks {
+        if task.state() != axtask::TaskState::Exited {
+            let _ = axtask::force_exit_task(task, 128 + signum as i32);
+        }
+    }
+    tasks.len()
 }
 
 pub(crate) fn competition_script_root_is_alive() -> bool {
@@ -1470,8 +1541,7 @@ impl TaskExt {
         } else {
             #[cfg(target_arch = "loongarch64")]
             {
-                let private_fork_commit_limit =
-                    axconfig::plat::PHYS_MEMORY_SIZE.saturating_mul(64);
+                let private_fork_commit_limit = axconfig::plat::PHYS_MEMORY_SIZE.saturating_mul(64);
                 if !clone_flags.contains(CloneFlags::CLONE_VFORK)
                     && current_aspace.total_area_size() > private_fork_commit_limit
                 {
@@ -1607,7 +1677,9 @@ impl TaskExt {
             warm_page(child_tf.regs.gp, MappingFlags::READ);
             warm_page(child_tf.regs.tp, MappingFlags::READ | MappingFlags::WRITE);
             warm_page(
-                child_tf.get_sp().saturating_sub(core::mem::size_of::<usize>()),
+                child_tf
+                    .get_sp()
+                    .saturating_sub(core::mem::size_of::<usize>()),
                 MappingFlags::WRITE,
             );
         }
@@ -1677,11 +1749,7 @@ impl TaskExt {
         if trace_fork13 {
             warn!(
                 "[fork13-clone-task] child ids return_tid={} new_proc_id={} child_visible_tid={} leader_tid={} share_aspace={}",
-                return_id,
-                new_proc_id,
-                child_visible_tid,
-                new_leader_tid,
-                share_aspace,
+                return_id, new_proc_id, child_visible_tid, new_leader_tid, share_aspace,
             );
         }
         new_task_ext.set_exit_signal((flags & 0x3f) as u64);
@@ -2731,6 +2799,36 @@ pub(crate) fn wait_for_other_threads_in_group_to_exit(proc_id: usize, skip_tid: 
     }
 }
 
+pub(crate) fn exit_current_thread_group_for_signal(signum: usize, status: i32) -> ! {
+    const SIGKILL: usize = 9;
+
+    let curr = current();
+    let tid = curr.id().as_u64();
+    let proc_id = curr.task_ext().proc_id;
+    let leader_tid = curr.task_ext().leader_tid();
+    let sender_pid = curr.task_ext().proc_id as i32;
+    let sender_uid = axfs::api::current_uid();
+
+    for task in thread_group_tasks(proc_id) {
+        let target_tid = task.id().as_u64();
+        if target_tid == tid {
+            continue;
+        }
+        let target_signal = if target_tid == leader_tid {
+            signum
+        } else {
+            SIGKILL
+        };
+        crate::signal::send_tkill_signal_to_task(&task, target_signal, sender_pid, sender_uid);
+    }
+
+    if tid == leader_tid {
+        wait_for_other_threads_in_group_to_exit(proc_id, tid);
+    }
+
+    exit_current_task(status, true, true);
+}
+
 pub(crate) fn exit_current_task(
     status: i32,
     notify_parent_if_leader: bool,
@@ -2746,15 +2844,19 @@ pub(crate) fn exit_current_task(
     }
     record_exit_for_parent(status);
     crate::syscall_imp::record_process_accounting(status);
-    let (tid, clear_child_tid, is_thread_group_leader, fd_table_refs) = {
+    let (tid, proc_id, clear_child_tid, is_thread_group_leader, fd_table_refs) = {
         let curr = current();
         (
             curr.id().as_u64(),
+            curr.task_ext().proc_id,
             curr.task_ext().clear_child_tid() as *mut i32,
             curr.id().as_u64() == curr.task_ext().leader_tid(),
             FD_TABLE.deref_from(&curr.task_ext().ns).strong_count(),
         )
     };
+    let other_live_threads = thread_group_tasks(proc_id)
+        .iter()
+        .any(|task| task.id().as_u64() != tid);
     if notify_parent_if_leader && is_thread_group_leader {
         notify_parent_sigchld();
     }
@@ -2766,9 +2868,26 @@ pub(crate) fn exit_current_task(
         crate::syscall_imp::detach_sysv_shm_process(curr.task_ext().proc_id, &mut aspace);
     }
     crate::syscall_imp::clear_child_tid_and_wake(clear_child_tid);
-    if close_fds_if_leader && is_thread_group_leader && fd_table_refs == 1 {
+    if close_fds_if_leader && is_thread_group_leader && (fd_table_refs == 1 || !other_live_threads)
+    {
         crate::syscall_imp::cleanup_all_fd_tracking_for_current_process();
         close_all_fds_fast();
+    }
+    {
+        let curr = current();
+        let aspace = &curr.task_ext().aspace;
+        if Arc::strong_count(aspace) == 1 {
+            let mut aspace = aspace.lock();
+            if let Err(err) = aspace.unmap_user_areas() {
+                warn!(
+                    "release user address space on exit failed: task={} pid={} err={:?}",
+                    curr.id_name(),
+                    curr.task_ext().proc_id,
+                    err
+                );
+                aspace.clear();
+            }
+        }
     }
     unregister_live_task(current().as_task_ref());
     if is_thread_group_leader {
@@ -2832,8 +2951,8 @@ fn reparent_orphaned_children_on_exit(curr: &AxTaskRef) {
         return;
     }
 
-    let Some(init_task) = find_process_leader_by_pid(1)
-        .filter(|init| init.id().as_u64() != curr.id().as_u64())
+    let Some(init_task) =
+        find_process_leader_by_pid(1).filter(|init| init.id().as_u64() != curr.id().as_u64())
     else {
         let children = {
             let mut children = curr.task_ext().children.lock();
