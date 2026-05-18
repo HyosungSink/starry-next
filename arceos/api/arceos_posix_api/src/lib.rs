@@ -59,12 +59,13 @@ pub use imp::fd_ops::{
 };
 #[cfg(feature = "fs")]
 pub use imp::fs::{
-    Directory, File, LoopControlDevice, LoopDeviceFile, PROC_NET_IPV4_CONF_DEFAULT_TAG,
-    PROC_NET_IPV4_CONF_LO_TAG, clear_proc_cgroup_mount_path, get_file_times, get_path_times,
-    has_open_writable_file_under, note_removed_directory, proc_cgroup_mount_path,
-    remove_named_tmpfile_path, set_file_times, set_path_times, set_proc_cgroup_mount_path,
-    sys_fstat, sys_getcwd, sys_lseek, sys_lstat, sys_open, sys_openat, sys_rename, sys_stat,
-    virtual_device_stat,
+    Directory, File, LoopControlDevice, LoopDeviceDiagnostics, LoopDeviceFile,
+    NamedTmpFileDiagnostics, PROC_NET_IPV4_CONF_DEFAULT_TAG, PROC_NET_IPV4_CONF_LO_TAG,
+    clear_proc_cgroup_mount_path, diagnostic_loop_device_state, diagnostic_named_tmpfiles,
+    get_file_times, get_path_times, has_open_writable_file_under, note_removed_directory,
+    proc_cgroup_mount_path, remove_named_tmpfile_path, set_file_times, set_path_times,
+    set_proc_cgroup_mount_path, sys_fstat, sys_getcwd, sys_lseek, sys_lstat, sys_open,
+    sys_openat, sys_rename, sys_stat, virtual_device_stat,
 };
 #[cfg(feature = "select")]
 pub use imp::io_mpx::sys_select;

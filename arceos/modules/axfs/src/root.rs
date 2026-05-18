@@ -134,6 +134,33 @@ pub struct MountTableEntry {
     pub kind: MountedFsKind,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MountDiagnostics {
+    pub total: usize,
+    pub ext4: usize,
+    pub fat: usize,
+    pub ramfs: usize,
+    pub devfs: usize,
+    pub procfs: usize,
+    pub sysfs: usize,
+    pub unknown: usize,
+}
+
+impl MountDiagnostics {
+    fn add_kind(&mut self, kind: MountedFsKind) {
+        self.total += 1;
+        match kind {
+            MountedFsKind::Ext4 => self.ext4 += 1,
+            MountedFsKind::Fat => self.fat += 1,
+            MountedFsKind::Ramfs => self.ramfs += 1,
+            MountedFsKind::Devfs => self.devfs += 1,
+            MountedFsKind::Procfs => self.procfs += 1,
+            MountedFsKind::Sysfs => self.sysfs += 1,
+            MountedFsKind::Unknown => self.unknown += 1,
+        }
+    }
+}
+
 fn default_inode_for_path(path: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in path.as_bytes() {
@@ -440,6 +467,15 @@ impl RootDirectory {
                 kind: mp.kind,
             })
             .collect()
+    }
+
+    pub fn mount_diagnostics(&self) -> MountDiagnostics {
+        let mut stats = MountDiagnostics::default();
+        stats.add_kind(self.main_fs_kind);
+        for mount in self.mounts.read().iter() {
+            stats.add_kind(mount.kind);
+        }
+        stats
     }
 
     fn lookup_mounted_fs<F, T>(&self, path: &str, f: F) -> AxResult<T>
@@ -1249,6 +1285,10 @@ pub(crate) fn root_fs_kind() -> MountedFsKind {
 
 pub(crate) fn mount_table_entries() -> Vec<MountTableEntry> {
     ROOT_DIR.mount_table_entries()
+}
+
+pub(crate) fn mount_diagnostics() -> MountDiagnostics {
+    ROOT_DIR.mount_diagnostics()
 }
 
 pub(crate) fn reclaim_filesystem_caches() -> usize {

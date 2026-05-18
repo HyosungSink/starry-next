@@ -12,7 +12,7 @@ use axfs_vfs::{VfsNodePerm, VfsNodeType};
 use axio::{self as io, prelude::*};
 use cap_access::Cap;
 
-pub use crate::root::MountedFsKind as PathMountKind;
+pub use crate::root::{MountDiagnostics, MountedFsKind as PathMountKind};
 #[cfg(feature = "lwext4_rs")]
 pub use lwext4_rust::KernelDevOp;
 
@@ -260,6 +260,33 @@ pub fn path_mount_kind(path: &str) -> PathMountKind {
 
 pub fn reclaim_caches() -> usize {
     crate::root::reclaim_filesystem_caches()
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RamFsQuotaDiagnostics {
+    pub live_filesystems: usize,
+    pub used_bytes: usize,
+    pub max_bytes: usize,
+}
+
+pub fn diagnostic_mount_stats() -> MountDiagnostics {
+    crate::root::mount_diagnostics()
+}
+
+pub fn diagnostic_ramfs_quota_stats() -> RamFsQuotaDiagnostics {
+    #[cfg(feature = "ramfs")]
+    {
+        let stats = crate::fs::ramfs::diagnostic_quota_usage();
+        RamFsQuotaDiagnostics {
+            live_filesystems: stats.live_filesystems,
+            used_bytes: stats.used_bytes,
+            max_bytes: stats.max_bytes,
+        }
+    }
+    #[cfg(not(feature = "ramfs"))]
+    {
+        RamFsQuotaDiagnostics::default()
+    }
 }
 
 pub fn proc_mounts_contents() -> String {

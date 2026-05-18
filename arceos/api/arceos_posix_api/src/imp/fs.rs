@@ -117,6 +117,19 @@ const REGULAR_FS_DEV_ID: u64 = 1;
 const TMPFILE_FS_DEV_ID: u64 = 2;
 static LOOP_DEVICE_STATE: Mutex<LoopDeviceState> = Mutex::new(LoopDeviceState::new());
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LoopDeviceDiagnostics {
+    pub has_backing: bool,
+    pub configured: bool,
+    pub visible_size: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NamedTmpFileDiagnostics {
+    pub entries: usize,
+    pub allocated_bytes: usize,
+}
+
 struct LoopDeviceState {
     backing: Option<Arc<dyn FileLike>>,
     configured: bool,
@@ -131,6 +144,27 @@ impl LoopDeviceState {
             visible_size: 0,
         }
     }
+}
+
+pub fn diagnostic_loop_device_state() -> LoopDeviceDiagnostics {
+    let state = LOOP_DEVICE_STATE.lock();
+    LoopDeviceDiagnostics {
+        has_backing: state.backing.is_some(),
+        configured: state.configured,
+        visible_size: state.visible_size,
+    }
+}
+
+pub fn diagnostic_named_tmpfiles() -> NamedTmpFileDiagnostics {
+    let named_tmpfiles = NAMED_TMPFILES.lock();
+    let mut stats = NamedTmpFileDiagnostics {
+        entries: named_tmpfiles.len(),
+        allocated_bytes: 0,
+    };
+    for backing in named_tmpfiles.values() {
+        stats.allocated_bytes += backing.state.lock().chunks.len() * TMPFILE_CHUNK_SIZE;
+    }
+    stats
 }
 
 def_resource! {
@@ -301,7 +335,12 @@ fn path_times_for(path: &str, is_dir: bool, default: FileTimes) -> FileTimes {
 }
 
 fn store_path_times_key(path_key: &str, times: FileTimes) {
-    PATH_TIMES.lock().insert(path_key.to_string(), times);
+    let mut map = PATH_TIMES.lock();
+    if let Some(existing) = map.get_mut(path_key) {
+        *existing = times;
+    } else {
+        map.insert(path_key.to_string(), times);
+    }
 }
 
 fn store_path_times(path: &str, is_dir: bool, times: FileTimes) {
