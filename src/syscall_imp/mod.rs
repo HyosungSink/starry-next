@@ -20,7 +20,7 @@ fn should_trace_clone08() -> bool {
 }
 
 pub(crate) use self::fs::*;
-use self::mm::*;
+pub(crate) use self::mm::*;
 pub(crate) use self::task::*;
 pub(crate) use self::utils::*;
 
@@ -1140,9 +1140,15 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
                     tf.arg2() as _,
                     tf.arg3() as _,
                 ) as _,
-                Sysno::listxattr => sys_listxattr(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
-                Sysno::llistxattr => sys_llistxattr(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
-                Sysno::flistxattr => sys_flistxattr(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
+                Sysno::listxattr => {
+                    sys_listxattr(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _
+                }
+                Sysno::llistxattr => {
+                    sys_llistxattr(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _
+                }
+                Sysno::flistxattr => {
+                    sys_flistxattr(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _
+                }
                 Sysno::removexattr => sys_removexattr(tf.arg0() as _, tf.arg1() as _) as _,
                 Sysno::lremovexattr => sys_lremovexattr(tf.arg0() as _, tf.arg1() as _) as _,
                 Sysno::fremovexattr => sys_fremovexattr(tf.arg0() as _, tf.arg1() as _) as _,

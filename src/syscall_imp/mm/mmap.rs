@@ -11,7 +11,7 @@ use axhal::mem::phys_to_virt;
 use axhal::paging::MappingFlags;
 #[cfg(feature = "contest_diag_logs")]
 use axhal::time::monotonic_time_nanos;
-use axmm::{alloc_user_frame, SharedFrames};
+use axmm::{alloc_user_frame, dec_frame_ref, SharedFrames};
 use axtask::{current, TaskExtRef};
 use core::sync::atomic::AtomicBool;
 #[cfg(target_arch = "riscv64")]
@@ -49,6 +49,34 @@ fn shared_file_mapping_registry(
     REGISTRY.call_once(|| Mutex::new(BTreeMap::new()))
 }
 
+pub(crate) fn reclaim_shared_file_mapping_cache() -> usize {
+    let mut registry = shared_file_mapping_registry().lock();
+    let mut reclaimed_pages = 0usize;
+    registry.retain(|_, frames| {
+        if Arc::strong_count(frames) > 1 {
+            true
+        } else {
+            reclaimed_pages = reclaimed_pages.saturating_add(frames.len());
+            false
+        }
+    });
+    reclaimed_pages
+}
+
+pub(crate) fn invalidate_shared_file_mapping_cache_path(path: &str) -> usize {
+    let mut registry = shared_file_mapping_registry().lock();
+    let mut reclaimed_pages = 0usize;
+    registry.retain(|key, frames| {
+        if key.path == path && Arc::strong_count(frames) == 1 {
+            reclaimed_pages = reclaimed_pages.saturating_add(frames.len());
+            false
+        } else {
+            true
+        }
+    });
+    reclaimed_pages
+}
+
 fn shared_file_mapping_frames(
     file: &arceos_posix_api::File,
     offset: usize,
@@ -73,7 +101,12 @@ fn shared_file_mapping_frames(
     let mut file_handle = file.inner().lock();
 
     for page_index in 0..page_count {
-        let frame = alloc_user_frame(true).ok_or(LinuxError::ENOMEM)?;
+        let Some(frame) = alloc_user_frame(true) else {
+            for frame in frames.drain(..) {
+                dec_frame_ref(frame);
+            }
+            return Err(LinuxError::ENOMEM);
+        };
         let page_file_offset = offset + page_index * PAGE_SIZE_4K;
         if page_file_offset < file_size {
             let available = core::cmp::min(PAGE_SIZE_4K, file_size - page_file_offset);
@@ -82,7 +115,17 @@ fn shared_file_mapping_frames(
                 core::slice::from_raw_parts_mut(phys_to_virt(frame).as_mut_ptr(), available)
             };
             while read < available {
-                let n = file_handle.read_at((page_file_offset + read) as u64, &mut dst[read..])?;
+                let n =
+                    match file_handle.read_at((page_file_offset + read) as u64, &mut dst[read..]) {
+                        Ok(n) => n,
+                        Err(err) => {
+                            dec_frame_ref(frame);
+                            for frame in frames.drain(..) {
+                                dec_frame_ref(frame);
+                            }
+                            return Err(err.into());
+                        }
+                    };
                 if n == 0 {
                     break;
                 }
