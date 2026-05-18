@@ -426,6 +426,7 @@ impl UdpSocket {
             f()
         } else {
             let deadline = timeout.map(|t| monotonic_time() + t);
+            let mut progress_yields = 0usize;
             loop {
                 match f() {
                     Ok(t) => return Ok(t),
@@ -436,9 +437,11 @@ impl UdpSocket {
                         if axtask::current_wait_should_interrupt() {
                             return Err(AxError::WouldBlock);
                         }
-                        if SOCKET_SET.poll_interfaces() {
+                        if SOCKET_SET.poll_interfaces() && progress_yields < 32 {
+                            progress_yields += 1;
                             axtask::yield_now();
                         } else {
+                            progress_yields = 0;
                             axtask::sleep(Duration::from_millis(1));
                         }
                     }

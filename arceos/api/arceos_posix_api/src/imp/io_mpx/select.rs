@@ -149,6 +149,7 @@ pub unsafe fn sys_select(
         let fd_sets = unsafe { FdSets::from_user(nfds, readfds, writefds, exceptfds) };
         let mut ready_sets = ReadyFdSets::new();
 
+        let mut progress_yields = 0usize;
         loop {
             #[cfg(feature = "net")]
             let net_progress = axnet::poll_interfaces();
@@ -185,9 +186,11 @@ pub unsafe fn sys_select(
                 }
                 return Ok(0);
             }
-            if net_progress {
+            if net_progress && progress_yields < 32 {
+                progress_yields += 1;
                 axtask::yield_now();
             } else {
+                progress_yields = 0;
                 axtask::sleep(Duration::from_millis(1));
             }
         }
