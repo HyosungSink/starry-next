@@ -10,7 +10,9 @@ mod aspace;
 mod backend;
 
 pub use self::aspace::AddrSpace;
-pub use self::backend::{Backend, SharedFrames, alloc_user_frame, dec_frame_ref};
+pub use self::backend::{
+    Backend, FrameRefStats, SharedFrames, alloc_user_frame, dec_frame_ref, frame_ref_stats,
+};
 
 use axerrno::{AxError, AxResult};
 use axhal::mem::phys_to_virt;

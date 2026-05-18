@@ -16,6 +16,20 @@ static MAP_ALLOC_OOM_WARN_COUNT: AtomicUsize = AtomicUsize::new(0);
 const MAP_ALLOC_OOM_WARN_BURST: usize = 4;
 const MAP_ALLOC_OOM_WARN_PERIOD: usize = 32;
 
+fn sync_instruction_stream_for_mapping(flags: MappingFlags) {
+    if !flags.contains(MappingFlags::EXECUTE) {
+        return;
+    }
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("fence.i");
+    }
+    #[cfg(target_arch = "loongarch64")]
+    unsafe {
+        core::arch::asm!("ibar 0");
+    }
+}
+
 pub struct SharedFrames {
     frames: Vec<PhysAddr>,
 }
@@ -130,6 +144,27 @@ impl CowPageRegistry {
             let mut owned = self.owned_pages.lock();
             let pages = owned.iter().copied().collect();
             owned.clear();
+            pages
+        };
+        if owned_pages.is_empty() {
+            return Vec::new();
+        }
+        let pages = self.pages.lock();
+        owned_pages
+            .into_iter()
+            .filter_map(|page| pages.get(&page).copied())
+            .collect()
+    }
+
+    pub(crate) fn take_owned_frames_except(&self, exclude: &BTreeSet<usize>) -> Vec<PhysAddr> {
+        let owned_pages: Vec<usize> = {
+            let mut owned = self.owned_pages.lock();
+            let pages = owned
+                .iter()
+                .copied()
+                .filter(|page| !exclude.contains(page))
+                .collect();
+            owned.retain(|page| exclude.contains(page));
             pages
         };
         if owned_pages.is_empty() {
@@ -389,6 +424,22 @@ pub fn dec_frame_ref(frame: PhysAddr) {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FrameRefStats {
+    pub tracked_frames: usize,
+    pub total_refs: usize,
+    pub max_refcount: usize,
+}
+
+pub fn frame_ref_stats() -> FrameRefStats {
+    let refs = frame_refcounts().lock();
+    FrameRefStats {
+        tracked_frames: refs.len(),
+        total_refs: refs.values().sum(),
+        max_refcount: refs.values().copied().max().unwrap_or(0),
+    }
+}
+
 impl Backend {
     /// Creates a new allocation mapping backend.
     pub fn new_alloc(populate: bool) -> Self {
@@ -578,10 +629,21 @@ impl Backend {
             _ => return false,
         };
         if let Some(shared_frames) = shared_frames.as_ref() {
-            if let Some(frame) = shared_frames.lock().get(&page.as_usize()).copied() {
-                pages.lock().insert(page.as_usize(), frame);
+            let shared_frame = shared_frames.lock().get(&page.as_usize()).copied();
+            if let Some(frame) = shared_frame {
+                if let Ok((old_paddr, cur_flags, _)) = pt.query(page) {
+                    if !cur_flags.is_empty() && old_paddr.align_down_4k() == frame.align_down_4k() {
+                        pages.lock().insert(page.as_usize(), frame);
+                        return install_page_mapping(pt, page, frame, orig_flags);
+                    }
+                }
                 inc_frame_ref(frame);
-                return install_page_mapping(pt, page, frame, orig_flags);
+                if install_page_mapping(pt, page, frame, orig_flags) {
+                    pages.lock().insert(page.as_usize(), frame);
+                    return true;
+                }
+                dec_frame_ref(frame);
+                return false;
             }
         }
         if access_flags.contains(MappingFlags::WRITE) && orig_flags.contains(MappingFlags::WRITE) {
@@ -619,7 +681,18 @@ impl Backend {
             }
             pages.lock().insert(page.as_usize(), frame);
             // Allocate a physical frame lazily and map it to the fault address.
-            install_page_mapping(pt, page, frame, orig_flags)
+            if install_page_mapping(pt, page, frame, orig_flags) {
+                true
+            } else {
+                pages.lock().remove(&page.as_usize());
+                if let Some(shared_frames) = shared_frames.as_ref() {
+                    if shared_frames.lock().remove(&page.as_usize()).is_some() {
+                        dec_frame_ref(frame);
+                    }
+                }
+                dec_frame_ref(frame);
+                false
+            }
         } else {
             false
         }
@@ -642,6 +715,7 @@ impl Backend {
             Backend::Cow { pages } => pages,
             _ => return false,
         };
+        let mut unmapped_pages = BTreeSet::new();
         let mut unmapped_frames = Vec::new();
         for page_index in pages.page_indices() {
             let addr = start + (page_index * PAGE_SIZE_4K);
@@ -653,10 +727,11 @@ impl Backend {
                     return false;
                 }
                 tlb.flush();
+                unmapped_pages.insert(page_index);
                 unmapped_frames.push(frame);
             }
         }
-        unmapped_frames.extend(pages.take_owned_frames());
+        unmapped_frames.extend(pages.take_owned_frames_except(&unmapped_pages));
         dec_frame_refs(&unmapped_frames);
         true
     }
@@ -890,6 +965,7 @@ impl Backend {
         };
         inc_frame_ref(frame);
         if install_page_mapping(pt, page, frame, orig_flags) {
+            sync_instruction_stream_for_mapping(orig_flags);
             true
         } else {
             dec_frame_ref(frame);

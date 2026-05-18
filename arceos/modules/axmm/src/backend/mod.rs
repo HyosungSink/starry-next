@@ -9,7 +9,7 @@ use memory_set::MappingBackend;
 mod alloc;
 mod linear;
 
-pub use self::alloc::{SharedFrames, alloc_user_frame, dec_frame_ref};
+pub use self::alloc::{FrameRefStats, SharedFrames, alloc_user_frame, dec_frame_ref, frame_ref_stats};
 pub(crate) use self::alloc::{CowPageRegistry, SharedPageRegistry};
 pub(crate) use self::alloc::{inc_frame_ref, inc_frame_refs};
 

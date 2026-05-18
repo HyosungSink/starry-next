@@ -255,13 +255,18 @@ impl AddrSpace {
                     let count = (area.end().min(end) - start).align_up_4k() / PAGE_SIZE_4K;
                     for i in 0..count {
                         let addr = start + i * PAGE_SIZE_4K;
-                        area_backend.handle_page_fault_alloc(
+                        if matches!(self.pt.query(addr), Ok((_paddr, flags, _)) if !flags.is_empty()) {
+                            continue;
+                        }
+                        if !area_backend.handle_page_fault_alloc(
                             addr,
                             MappingFlags::empty(),
                             area.flags(),
                             &mut self.pt,
                             *populate,
-                        );
+                        ) {
+                            return Err(AxError::NoMemory);
+                        }
                     }
                 }
             }
@@ -335,7 +340,7 @@ impl AddrSpace {
         Ok(())
     }
 
-    /// Add a shared mapping backed by fixed frames keyed by virtual page.
+    /// Add a shared mapping backed by a fixed frame vector.
     pub fn map_shared_frames(
         &mut self,
         start: VirtAddr,
@@ -352,12 +357,7 @@ impl AddrSpace {
         if frames.len() * PAGE_SIZE_4K != size {
             return ax_err!(InvalidInput, "frame vector size mismatch");
         }
-        let indexed_frames = frames
-            .iter()
-            .enumerate()
-            .map(|(index, frame)| (start.as_usize() + index * PAGE_SIZE_4K, *frame))
-            .collect();
-        let area = MemoryArea::new(start, size, flags, Backend::new_shared_pages(indexed_frames));
+        let area = MemoryArea::new(start, size, flags, Backend::new_segment_shared(frames));
         self.areas
             .map(area, &mut self.pt, false)
             .map_err(mapping_err_to_ax_err)?;
