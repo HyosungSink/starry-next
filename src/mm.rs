@@ -11,7 +11,7 @@ use alloc::{
     vec::Vec,
 };
 
-use axalloc::global_allocator;
+use axalloc::{global_allocator, GlobalPage};
 use axerrno::{AxError, AxResult};
 use axfs::api::File;
 use axhal::{
@@ -22,7 +22,7 @@ use axhal::{
 use axstd::io::Read;
 use axsync::Mutex;
 
-use axmm::{alloc_user_frame, AddrSpace, SharedFrames};
+use axmm::{alloc_user_frame, dec_frame_ref, AddrSpace, SharedFrames};
 use axtask::{current, TaskExtRef};
 use kernel_elf_parser::{app_stack_region, AuxvEntry, AuxvType, ELFParser};
 use memory_addr::{MemoryAddr, PageIter4K, VirtAddr, PAGE_SIZE_4K};
@@ -35,10 +35,10 @@ use xmas_elf::{
 use crate::embedded_runtime::MUSL_INTERP_BYTES;
 
 const EXEC_IMAGE_CACHE_MAX_ENTRIES: usize = 8;
-const EXEC_SEGMENT_CACHE_MAX_ENTRIES: usize = 32;
+const EXEC_SEGMENT_CACHE_MAX_ENTRIES: usize = 12;
 const EXEC_IMAGE_CACHE_MAX_FILE_SIZE: usize = 16 * 1024 * 1024;
 const EXEC_IMAGE_CACHE_MAX_BYTES: usize = 8 * 1024 * 1024;
-const EXEC_SEGMENT_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const EXEC_SEGMENT_CACHE_MAX_BYTES: usize = 6 * 1024 * 1024;
 const ONLINE_INTERP_DIAG_LOG_LIMIT: usize = 24;
 const ONLINE_LOAD_DIAG_LOG_LIMIT: usize = 32;
 #[cfg(target_arch = "loongarch64")]
@@ -126,7 +126,7 @@ fn should_admit_exec_image_cache_entry() -> bool {
 
 fn should_admit_exec_segment_cache_entry() -> bool {
     let low_watermark = runtime_exec_cache_low_watermark_pages();
-    global_allocator().available_pages() > low_watermark.saturating_div(4).max(1024)
+    global_allocator().available_pages() > low_watermark
 }
 
 fn should_log_map_alloc_failure() -> Option<usize> {
@@ -570,39 +570,51 @@ fn log_userboot_fault_handled(
 }
 
 struct PageBackedBytes {
-    bytes: Vec<u8>,
+    pages: Option<GlobalPage>,
+    len: usize,
 }
 
 impl PageBackedBytes {
+    fn page_count(len: usize) -> usize {
+        len.div_ceil(PAGE_SIZE_4K)
+    }
+
+    fn alloc_for_len(len: usize) -> AxResult<Option<GlobalPage>> {
+        let page_count = Self::page_count(len);
+        if page_count == 0 {
+            return Ok(None);
+        }
+        GlobalPage::alloc_contiguous(page_count, PAGE_SIZE_4K)
+            .map(Some)
+            .map_err(|_| AxError::NoMemory)
+    }
+
     fn from_slice(data: &[u8]) -> AxResult<Self> {
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(data.len())
-            .map_err(|_| AxError::NoMemory)?;
-        bytes.extend_from_slice(data);
+        let mut pages = Self::alloc_for_len(data.len())?;
+        if let Some(pages) = pages.as_mut() {
+            pages.as_slice_mut()[..data.len()].copy_from_slice(data);
+        }
         Ok(Self {
-            bytes,
+            pages,
+            len: data.len(),
         })
     }
 
     fn read_from_path(path: &str) -> AxResult<Self> {
         let mut file = File::open(path)?;
         let len = file.metadata()?.len() as usize;
-        if len == 0 {
-            return Self::from_slice(&[]);
+        let mut pages = Self::alloc_for_len(len)?;
+        if let Some(pages) = pages.as_mut() {
+            file.read_exact(&mut pages.as_slice_mut()[..len])?;
         }
-
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(len)
-            .map_err(|_| AxError::NoMemory)?;
-        bytes.resize(len, 0);
-        file.read_exact(&mut bytes)?;
-        Ok(Self { bytes })
+        Ok(Self { pages, len })
     }
 
     fn as_slice(&self) -> &[u8] {
-        self.bytes.as_slice()
+        match self.pages.as_ref() {
+            Some(pages) => &pages.as_slice()[..self.len],
+            None => &[],
+        }
     }
 }
 
@@ -681,22 +693,32 @@ fn trim_exec_segment_cache(cache: &mut Vec<(String, usize, Arc<SharedFrames>)>, 
 }
 
 fn normalize_exec_cache_path(path: &str) -> String {
-    if path.starts_with('/') {
-        axfs::api::canonicalize(path).unwrap_or_else(|_| path.to_string())
-    } else {
-        path.to_string()
-    }
+    absolute_exec_path(path)
 }
 
 pub(crate) fn invalidate_exec_cache_path(path: &str) {
+    let mut candidates = Vec::new();
     let normalized = normalize_exec_cache_path(path);
+    push_unique_path(&mut candidates, normalized.clone());
+    if let Ok(resolved) = resolve_final_symlink_path(normalized.as_str()) {
+        push_unique_path(&mut candidates, resolved);
+    }
+    let current = candidates.clone();
+    for candidate in current {
+        if let Some(alias) = exec_alias_path(candidate.as_str()) {
+            push_unique_path(&mut candidates, alias);
+        }
+    }
+
     exec_image_cache()
         .lock()
-        .retain(|(cached_path, _, _)| cached_path != &normalized);
-    let segment_prefix = alloc::format!("{normalized}@");
-    exec_segment_cache()
-        .lock()
-        .retain(|(cached_key, _, _)| !cached_key.starts_with(segment_prefix.as_str()));
+        .retain(|(cached_path, _, _)| !candidates.iter().any(|path| cached_path == path));
+    exec_segment_cache().lock().retain(|(cached_key, _, _)| {
+        !candidates.iter().any(|path| {
+            let segment_prefix = alloc::format!("{path}@");
+            cached_key.starts_with(segment_prefix.as_str())
+        })
+    });
 }
 
 fn should_cache_exec_segment(path: &str, flags: MappingFlags, file_size: usize) -> bool {
@@ -712,16 +734,27 @@ fn exec_segment_key(
     seg_vaddr: VirtAddr,
     seg_offset: usize,
     flags: MappingFlags,
+    data_hash: u64,
 ) -> String {
     alloc::format!(
-        "{}@{:x}:{:x}:{:x}:{:x}:{:x}",
+        "{}@{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
         path,
         seg_start.as_usize(),
         seg_size,
         seg_vaddr.as_usize(),
         seg_offset,
-        flags.bits()
+        flags.bits(),
+        data_hash
     )
+}
+
+fn exec_segment_data_hash(data: &[u8]) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    data.iter().fold(FNV_OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+    })
 }
 
 fn shared_exec_segment_frames(
@@ -733,11 +766,24 @@ fn shared_exec_segment_frames(
     seg_data: &[u8],
     flags: MappingFlags,
 ) -> AxResult<Option<Arc<SharedFrames>>> {
-    if !should_cache_exec_segment(path, flags, seg_data.len()) {
+    let normalized_path = normalize_exec_cache_path(path);
+    if !should_cache_exec_segment(normalized_path.as_str(), flags, seg_data.len()) {
+        return Ok(None);
+    }
+    if !should_admit_exec_segment_cache_entry() {
         return Ok(None);
     }
 
-    let key = exec_segment_key(path, seg_start, seg_size, seg_vaddr, seg_offset, flags);
+    let data_hash = exec_segment_data_hash(seg_data);
+    let key = exec_segment_key(
+        normalized_path.as_str(),
+        seg_start,
+        seg_size,
+        seg_vaddr,
+        seg_offset,
+        flags,
+        data_hash,
+    );
     if let Some(frames) = exec_segment_cache()
         .lock()
         .iter()
@@ -749,11 +795,16 @@ fn shared_exec_segment_frames(
 
     let seg_pad = seg_vaddr.align_offset_4k();
     let mut frames = Vec::new();
-    frames
-        .try_reserve_exact(seg_size / PAGE_SIZE_4K)
-        .map_err(|_| AxError::NoMemory)?;
+    if frames.try_reserve_exact(seg_size / PAGE_SIZE_4K).is_err() {
+        return Ok(None);
+    }
     for page in PageIter4K::new(seg_start, seg_start + seg_size).unwrap() {
-        let frame = alloc_user_frame(true).ok_or(AxError::NoMemory)?;
+        let Some(frame) = alloc_user_frame(true) else {
+            for frame in frames.drain(..) {
+                dec_frame_ref(frame);
+            }
+            return Ok(None);
+        };
         let page_off = page.as_usize() - seg_start.as_usize();
         let seg_off_in_page = seg_pad.saturating_sub(page_off).min(PAGE_SIZE_4K);
         let data_off = page_off.saturating_sub(seg_pad);
@@ -783,6 +834,33 @@ fn shared_exec_segment_frames(
     Ok(Some(frames))
 }
 
+fn map_alloc_elf_range(
+    uspace: &mut AddrSpace,
+    path: &str,
+    start: VirtAddr,
+    end: VirtAddr,
+    flags: MappingFlags,
+    populate_segment: bool,
+) -> AxResult {
+    match uspace.map_alloc(start, end - start, flags, populate_segment) {
+        Ok(()) => Ok(()),
+        Err(err) if populate_segment => {
+            let reclaimed_exec_cache_pages = reclaim_exec_caches();
+            warn!(
+                "map_alloc eager failed for {} range [{:#x}, {:#x}) flags {:?} err={:?}; retry lazy reclaimed_exec_cache_pages={}",
+                path,
+                start.as_usize(),
+                end.as_usize(),
+                flags,
+                err,
+                reclaimed_exec_cache_pages
+            );
+            uspace.map_alloc(start, end - start, flags, false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 pub(crate) fn is_expected_exec_lookup_error(err: &AxError) -> bool {
     matches!(
         err,
@@ -800,7 +878,8 @@ fn read_user_image(path: &str) -> AxResult<ExecImage> {
         axfs::api::canonicalize(path).unwrap_or_else(|_| path.to_string())
     };
     let resolved_path = resolve_final_symlink_path(resolved_path.as_str()).unwrap_or(resolved_path);
-    let aliased_path = exec_alias_path(resolved_path.as_str()).unwrap_or_else(|| resolved_path.clone());
+    let aliased_path =
+        exec_alias_path(resolved_path.as_str()).unwrap_or_else(|| resolved_path.clone());
 
     if let Some(cached) = exec_image_cache()
         .lock()
@@ -874,8 +953,8 @@ fn read_user_image(path: &str) -> AxResult<ExecImage> {
         let cache_len = cache_bytes(image.as_slice().len());
         if should_admit_exec_image_cache_entry()
             && !cache
-            .iter()
-            .any(|(cached_path, _, _)| cached_path == &aliased_path)
+                .iter()
+                .any(|(cached_path, _, _)| cached_path == &aliased_path)
             && cache_len <= EXEC_IMAGE_CACHE_MAX_BYTES
         {
             trim_exec_image_cache(&mut cache, cache_len);
@@ -1500,20 +1579,22 @@ fn map_single_elf(path: &str, elf_parser: &ELFParser, uspace: &mut AddrSpace) ->
             }
         }
 
-        // Eagerly instantiate writable LOAD segments. Static glibc binaries rely
-        // on writable tail pages in .data/.bss being present before later
-        // startup mprotect/exit-handler activity, and the lazy path has been
-        // observed to leave those pages unavailable in online repro cases.
-        let populate_segment = true;
+        // Eagerly instantiate writable LOAD tails in the normal path; glibc
+        // startup and exit handlers are sensitive to those pages being present.
+        // If the eager path runs out of memory, map_alloc_elf_range retries the
+        // same range lazily after reclaiming caches.
+        let populate_segment = segement.flags.contains(MappingFlags::WRITE);
         let mut pending_start = None;
         let mut map_vaddr = seg_start;
         while map_vaddr < seg_end {
             match uspace.page_table().query(map_vaddr) {
                 Ok((_, flags, _)) if !flags.is_empty() => {
                     if let Some(start) = pending_start.take() {
-                        if let Err(err) = uspace.map_alloc(
+                        if let Err(err) = map_alloc_elf_range(
+                            uspace,
+                            path,
                             start,
-                            map_vaddr - start,
+                            map_vaddr,
                             segement.flags,
                             populate_segment,
                         ) {
@@ -1543,9 +1624,14 @@ fn map_single_elf(path: &str, elf_parser: &ELFParser, uspace: &mut AddrSpace) ->
             map_vaddr += PAGE_SIZE_4K;
         }
         if let Some(start) = pending_start.take() {
-            if let Err(err) =
-                uspace.map_alloc(start, seg_end - start, segement.flags, populate_segment)
-            {
+            if let Err(err) = map_alloc_elf_range(
+                uspace,
+                path,
+                start,
+                seg_end,
+                segement.flags,
+                populate_segment,
+            ) {
                 if let Some(count) = should_log_map_alloc_failure() {
                     warn!(
                         "map_alloc failed for {} range [{:#x}, {:#x}) flags {:?} err={:?} [sampled count={}]",
@@ -1927,13 +2013,7 @@ fn load_user_app_inner_with_image(
             if let Some((real_busybox, mut new_args)) =
                 rewrite_to_busybox_applet(program_path, args, applet.as_str())
             {
-                return load_user_app_inner(
-                    &real_busybox,
-                    &mut new_args,
-                    env,
-                    uspace,
-                    depth + 1,
-                );
+                return load_user_app_inner(&real_busybox, &mut new_args, env, uspace, depth + 1);
             }
         }
     }
@@ -1954,20 +2034,17 @@ fn load_user_app_inner_with_image(
                     .filter(|applet| applet != "busybox")
                     .or_else(|| inferred_busybox_applet_path(program_path));
                 let skip = if let Some(applet) = applet {
-                    let skip = args
-                        .front()
-                        .is_some_and(|first| {
-                            argv0_matches_exec_target(first.as_str(), program_path, applet.as_str())
-                        }) as usize;
+                    let skip = args.front().is_some_and(|first| {
+                        argv0_matches_exec_target(first.as_str(), program_path, applet.as_str())
+                    }) as usize;
                     new_args.push_back(applet);
                     skip
                 } else {
-                    args.front()
-                        .is_some_and(|first| {
-                            first == program_path
-                                || first == absolute_exec_path(program_path).as_str()
-                                || first == program_path.rsplit('/').next().unwrap_or("")
-                        }) as usize
+                    args.front().is_some_and(|first| {
+                        first == program_path
+                            || first == absolute_exec_path(program_path).as_str()
+                            || first == program_path.rsplit('/').next().unwrap_or("")
+                    }) as usize
                 };
                 for arg in args.iter().skip(skip) {
                     new_args.push_back(arg.clone());
