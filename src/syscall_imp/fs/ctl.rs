@@ -13,7 +13,7 @@ use axfs::api::KernelDevOp;
 use axhal::paging::MappingFlags;
 use axhal::time::{monotonic_time_nanos, wall_time, NANOS_PER_SEC};
 use axstd::io::SeekFrom;
-use axtask::{current, TaskExtRef};
+use axtask::{current, yield_now, TaskExtRef};
 use memory_addr::VirtAddr;
 
 use super::{
@@ -60,9 +60,7 @@ fn log_ext_mount_backend_warning(
 ) {
     if source == "/dev/zero" {
         let count = DEV_ZERO_EXT_MOUNT_WARN_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        if count <= DEV_ZERO_EXT_MOUNT_WARN_BURST
-            || count % DEV_ZERO_EXT_MOUNT_WARN_PERIOD == 0
-        {
+        if count <= DEV_ZERO_EXT_MOUNT_WARN_BURST || count % DEV_ZERO_EXT_MOUNT_WARN_PERIOD == 0 {
             warn!(
                 "mount ext source={source} target={target}: device backend failed: {backend_err:?}; image {backend_kind} failed: {image_err:?} [sampled count={count}]"
             );
@@ -391,13 +389,13 @@ fn ext4_parent_link_limit_hit(parent: &str) -> Result<bool, LinuxError> {
     if !parent_attr.is_dir() {
         return Err(LinuxError::ENOTDIR);
     }
-    if !matches!(axfs::api::path_mount_kind(parent), axfs::api::PathMountKind::Ext4) {
+    if !matches!(
+        axfs::api::path_mount_kind(parent),
+        axfs::api::PathMountKind::Ext4
+    ) {
         return Ok(false);
     }
-    Ok(
-        axfs::api::link_count(parent, parent_attr).map_err(LinuxError::from)?
-            >= EXT4_DIR_LINK_MAX,
-    )
+    Ok(axfs::api::link_count(parent, parent_attr).map_err(LinuxError::from)? >= EXT4_DIR_LINK_MAX)
 }
 
 #[cfg(feature = "lwext4_rs")]
@@ -545,9 +543,7 @@ fn read_mount_source_image(source: &str) -> Result<Vec<u8>, LinuxError> {
             return Err(LinuxError::EINVAL);
         }
         let mut image = Vec::new();
-        image
-            .try_reserve(size)
-            .map_err(|_| LinuxError::ENOMEM)?;
+        image.try_reserve(size).map_err(|_| LinuxError::ENOMEM)?;
         let mut buf = [0u8; 8192];
         loop {
             let read = file.read(&mut buf)?;
@@ -699,8 +695,7 @@ fn validate_fat_boot_sector(source: &str, dev: &FileLikeBlockDev) -> Result<(), 
     if sector[510] != 0x55 || sector[511] != 0xAA {
         warn!(
             "mount fat source={source}: bad boot sector signature={:#04x}{:#04x}",
-            sector[510],
-            sector[511],
+            sector[510], sector[511],
         );
         return Err(LinuxError::EINVAL);
     }
@@ -1102,16 +1097,16 @@ pub(crate) fn sys_mount(
 
         validate_path_components(target.as_str())?;
         let absolute_target = absolute_umount_target_path(target.as_str())?;
-        let target_attr = axfs::api::metadata_raw_nofollow(absolute_target.as_str())
-            .map_err(LinuxError::from)?;
+        let target_attr =
+            axfs::api::metadata_raw_nofollow(absolute_target.as_str()).map_err(LinuxError::from)?;
         if !target_attr.is_dir() {
             return Err(LinuxError::ENOTDIR);
         }
 
         if bind_mount {
             let source = absolute_mount_source_path(source.as_str())?;
-            let source_attr = axfs::api::metadata_raw_nofollow(source.as_str())
-                .map_err(LinuxError::from)?;
+            let source_attr =
+                axfs::api::metadata_raw_nofollow(source.as_str()).map_err(LinuxError::from)?;
             if !source_attr.is_dir() {
                 return Err(LinuxError::EINVAL);
             }
@@ -1140,8 +1135,7 @@ pub(crate) fn sys_mount(
             if !axfs::api::mount_point_exists(absolute_target.as_str()).map_err(LinuxError::from)? {
                 return Err(LinuxError::EINVAL);
             }
-            if readonly
-                && arceos_posix_api::has_open_writable_file_under(absolute_target.as_str())
+            if readonly && arceos_posix_api::has_open_writable_file_under(absolute_target.as_str())
             {
                 return Err(LinuxError::EBUSY);
             }
@@ -1164,15 +1158,7 @@ pub(crate) fn sys_mount(
         }
         if !matches!(
             fs_type.as_str(),
-            "tmpfs"
-                | "ramfs"
-                | "overlay"
-                | "cgroup2"
-                | "vfat"
-                | "fat"
-                | "ext2"
-                | "ext3"
-                | "ext4"
+            "tmpfs" | "ramfs" | "overlay" | "cgroup2" | "vfat" | "fat" | "ext2" | "ext3" | "ext4"
         ) {
             return if fs_type.is_empty() {
                 Err(LinuxError::EINVAL)
@@ -1389,10 +1375,14 @@ pub(crate) fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> c_int {
                     })?;
                 }
             } else {
-                warn!(
-                    "Failed to create directory {}: {err:?}",
-                    normalized_path.as_str()
-                );
+                if matches!(err, LinuxError::EEXIST) {
+                    yield_now();
+                } else {
+                    warn!(
+                        "Failed to create directory {}: {err:?}",
+                        normalized_path.as_str()
+                    );
+                }
                 return Err(err);
             }
         }
@@ -1402,6 +1392,7 @@ pub(crate) fn sys_mkdirat(dirfd: i32, path: *const c_char, mode: u32) -> c_int {
         if is_cgroup_v2_dir(normalized_path.as_str()) {
             seed_cgroup_v2_dir(normalized_path.as_str())?;
         }
+        yield_now();
         Ok(0)
     })
 }
@@ -1794,8 +1785,10 @@ pub(crate) fn sys_getdents64(fd: i32, buf: *mut c_void, len: usize) -> isize {
         }
 
         for entry in &entries[..read_count] {
-            let name = entry.name_as_bytes();
-            let reclen = (name.len() + 1 + DirEnt::FIXED_SIZE + 7) & !7;
+            let raw_name = entry.name_as_bytes();
+            let name_len = core::cmp::min(raw_name.len(), DIRENT_MAX_NAME_LEN);
+            let name = &raw_name[..name_len];
+            let reclen = (name_len + 1 + DirEnt::FIXED_SIZE + 7) & !7;
             if !buffer.can_fit_entry(reclen) {
                 break;
             }
@@ -1803,10 +1796,10 @@ pub(crate) fn sys_getdents64(fd: i32, buf: *mut c_void, len: usize) -> isize {
             cursor += reclen as i64;
             let dirent = DirEnt::new(1, cursor, reclen, FileType::from(entry.entry_type()));
             let mut name_bytes = [0u8; DIRENT_MAX_NAME_LEN + 1];
-            name_bytes[..name.len()].copy_from_slice(name);
-            name_bytes[name.len()] = 0;
+            name_bytes[..name_len].copy_from_slice(name);
+            name_bytes[name_len] = 0;
             if buffer
-                .write_entry(dirent, &name_bytes[..name.len() + 1])
+                .write_entry(dirent, &name_bytes[..name_len + 1])
                 .is_err()
             {
                 break;
@@ -1882,8 +1875,7 @@ pub(crate) fn sys_linkat(
 pub fn sys_unlinkat(dir_fd: isize, path: *const u8, flags: usize) -> isize {
     const AT_REMOVEDIR: usize = 0x200;
     syscall_body!(sys_unlinkat, {
-        let path = handle_user_path(dir_fd, path, false)
-            .inspect_err(log_unlinkat_error)?;
+        let path = handle_user_path(dir_fd, path, false).inspect_err(log_unlinkat_error)?;
         if flags == AT_REMOVEDIR {
             if is_cgroup_v2_dir(path.as_str()) {
                 cleanup_cgroup_v2_tree(path.as_str());
@@ -1898,10 +1890,18 @@ pub fn sys_unlinkat(dir_fd: isize, path: *const u8, flags: usize) -> isize {
                 }
                 return Ok(0);
             }
-            axfs::api::remove_dir(path.as_str())
-                .inspect_err(log_unlinkat_ax_error)?;
+            if let Err(err) = axfs::api::remove_dir(path.as_str()) {
+                let linux_err = LinuxError::from(err);
+                if matches!(linux_err, LinuxError::ENOENT) {
+                    yield_now();
+                }
+                log_unlinkat_ax_error(&err);
+                return Err(linux_err);
+            }
             api::note_removed_directory(path.as_str());
             crate::mm::invalidate_exec_cache_path(path.as_str());
+            crate::syscall_imp::invalidate_shared_file_mapping_cache_path(path.as_str());
+            yield_now();
             return Ok(0);
         }
         let metadata = axfs::api::metadata(path.as_str()).inspect_err(log_unlinkat_ax_error)?;
@@ -1914,11 +1914,11 @@ pub fn sys_unlinkat(dir_fd: isize, path: *const u8, flags: usize) -> isize {
             .remove_link(&path)
             .is_none()
         {
-            axfs::api::remove_file(path.as_str())
-                .inspect_err(log_unlinkat_ax_error)?;
+            axfs::api::remove_file(path.as_str()).inspect_err(log_unlinkat_ax_error)?;
         }
         api::remove_named_tmpfile_path(path.as_str());
         crate::mm::invalidate_exec_cache_path(path.as_str());
+        crate::syscall_imp::invalidate_shared_file_mapping_cache_path(path.as_str());
         Ok(0)
     })
 }
@@ -2143,6 +2143,8 @@ pub(crate) fn sys_renameat2(
         axfs::api::rename(old_resolved.as_str(), new_resolved.as_str())?;
         crate::mm::invalidate_exec_cache_path(old_resolved.as_str());
         crate::mm::invalidate_exec_cache_path(new_resolved.as_str());
+        crate::syscall_imp::invalidate_shared_file_mapping_cache_path(old_resolved.as_str());
+        crate::syscall_imp::invalidate_shared_file_mapping_cache_path(new_resolved.as_str());
         Ok(0)
     })
 }
@@ -2186,6 +2188,7 @@ pub(crate) fn sys_ftruncate(fd: i32, length: api::ctypes::off_t) -> isize {
         let old_size = file.stat()?.st_size.max(0) as u64;
         if let Ok(file) = file.clone().into_any().downcast::<arceos_posix_api::File>() {
             crate::mm::invalidate_exec_cache_path(file.path());
+            crate::syscall_imp::invalidate_shared_file_mapping_cache_path(file.path());
         }
         notify_lease_break_for_fd(fd, true, true);
         if (length as u64) <= old_size {
@@ -2256,6 +2259,7 @@ pub(crate) fn sys_truncate(path: *const c_char, length: api::ctypes::off_t) -> i
             let old_size = file.stat()?.st_size.max(0) as u64;
             if let Ok(file) = file.clone().into_any().downcast::<arceos_posix_api::File>() {
                 crate::mm::invalidate_exec_cache_path(file.path());
+                crate::syscall_imp::invalidate_shared_file_mapping_cache_path(file.path());
             }
             notify_lease_break_for_fd(fd, true, true);
             if (length as u64) <= old_size {
@@ -2319,6 +2323,7 @@ pub(crate) fn sys_fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> isize 
                 other => other,
             })?;
         crate::mm::invalidate_exec_cache_path(file.path());
+        crate::syscall_imp::invalidate_shared_file_mapping_cache_path(file.path());
         Ok(0)
     })
 }
