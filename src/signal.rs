@@ -1140,54 +1140,57 @@ fn queue_posix_timer_signal(owner: &AxTaskRef, notify: i32, signum: usize, notif
 
 fn spawn_real_timer_worker(owner: &AxTaskRef, armed_seq: u64) {
     let owner = Arc::downgrade(owner);
-    axtask::spawn_raw(move || loop {
-        let Some(owner) = owner.upgrade() else {
-            return;
-        };
-
-        let (deadline_ns, interval_ns) = {
-            let signals = owner.task_ext().signals.lock();
-            if signals.real_timer_armed_seq != armed_seq || signals.real_timer_deadline_ns == 0 {
+    axtask::spawn_raw(
+        move || loop {
+            let Some(owner) = owner.upgrade() else {
                 return;
-            }
-            (
-                signals.real_timer_deadline_ns as u64,
-                signals.real_timer_interval_ns as u64,
-            )
-        };
+            };
 
-        let now_ns = monotonic_time_nanos();
-        if now_ns < deadline_ns {
-            axtask::sleep(core::time::Duration::from_nanos(
-                deadline_ns.saturating_sub(now_ns),
-            ));
-        }
-
-        let periodic = {
-            let now_ns = monotonic_time_nanos() as usize;
-            let mut signals = owner.task_ext().signals.lock();
-            if signals.real_timer_armed_seq != armed_seq || signals.real_timer_deadline_ns == 0 {
-                return;
-            }
-            if now_ns < signals.real_timer_deadline_ns {
-                true
-            } else {
-                signals.queue_signal(SIGALRM, None);
-                if signals.real_timer_interval_ns == 0 {
-                    signals.real_timer_deadline_ns = 0;
-                    false
-                } else {
-                    let overdue = now_ns - signals.real_timer_deadline_ns;
-                    let steps = overdue / signals.real_timer_interval_ns + 1;
-                    signals.real_timer_deadline_ns += steps * signals.real_timer_interval_ns;
-                    true
+            let (deadline_ns, interval_ns) = {
+                let signals = owner.task_ext().signals.lock();
+                if signals.real_timer_armed_seq != armed_seq || signals.real_timer_deadline_ns == 0
+                {
+                    return;
                 }
+                (
+                    signals.real_timer_deadline_ns as u64,
+                    signals.real_timer_interval_ns as u64,
+                )
+            };
+
+            let now_ns = monotonic_time_nanos();
+            if now_ns < deadline_ns {
+                axtask::sleep(core::time::Duration::from_nanos(
+                    deadline_ns.saturating_sub(now_ns),
+                ));
             }
-        };
-        wake_task_for_signal(&owner, SIGALRM);
-        if trace_setitimer01_task(&owner) {
-            if let Some(slot) = take_setitimer_diag_slot() {
-                warn!(
+
+            let periodic = {
+                let now_ns = monotonic_time_nanos() as usize;
+                let mut signals = owner.task_ext().signals.lock();
+                if signals.real_timer_armed_seq != armed_seq || signals.real_timer_deadline_ns == 0
+                {
+                    return;
+                }
+                if now_ns < signals.real_timer_deadline_ns {
+                    true
+                } else {
+                    signals.queue_signal(SIGALRM, None);
+                    if signals.real_timer_interval_ns == 0 {
+                        signals.real_timer_deadline_ns = 0;
+                        false
+                    } else {
+                        let overdue = now_ns - signals.real_timer_deadline_ns;
+                        let steps = overdue / signals.real_timer_interval_ns + 1;
+                        signals.real_timer_deadline_ns += steps * signals.real_timer_interval_ns;
+                        true
+                    }
+                }
+            };
+            wake_task_for_signal(&owner, SIGALRM);
+            if trace_setitimer01_task(&owner) {
+                if let Some(slot) = take_setitimer_diag_slot() {
+                    warn!(
                         "[setitimer-diag:{}] fire kind=real owner_tid={} owner_pid={} seq={} periodic={}",
                         slot,
                         owner.id().as_u64(),
@@ -1195,154 +1198,163 @@ fn spawn_real_timer_worker(owner: &AxTaskRef, armed_seq: u64) {
                         armed_seq,
                         periodic,
                     );
+                }
             }
-        }
-        if !periodic {
-            return;
-        }
-    }, "signal-real-timer".into(), SIGNAL_WORKER_STACK_SIZE);
+            if !periodic {
+                return;
+            }
+        },
+        "signal-real-timer".into(),
+        SIGNAL_WORKER_STACK_SIZE,
+    );
 }
 
 fn spawn_cpu_itimer_worker(owner: &AxTaskRef, which: i32, armed_seq: u64) {
     let owner = Arc::downgrade(owner);
-    axtask::spawn_raw(move || loop {
-        let Some(owner) = owner.upgrade() else {
-            return;
-        };
-        let proc_id = owner.task_ext().proc_id;
-        let (deadline_ns, interval_ns) = {
-            let signals = owner.task_ext().signals.lock();
-            match which {
-                ITIMER_VIRTUAL => {
-                    if signals.virtual_timer_armed_seq != armed_seq
-                        || signals.virtual_timer_deadline_ns == 0
-                    {
-                        return;
+    axtask::spawn_raw(
+        move || loop {
+            let Some(owner) = owner.upgrade() else {
+                return;
+            };
+            let proc_id = owner.task_ext().proc_id;
+            let (deadline_ns, interval_ns) = {
+                let signals = owner.task_ext().signals.lock();
+                match which {
+                    ITIMER_VIRTUAL => {
+                        if signals.virtual_timer_armed_seq != armed_seq
+                            || signals.virtual_timer_deadline_ns == 0
+                        {
+                            return;
+                        }
+                        (
+                            signals.virtual_timer_deadline_ns as u64,
+                            signals.virtual_timer_interval_ns as u64,
+                        )
                     }
-                    (
-                        signals.virtual_timer_deadline_ns as u64,
-                        signals.virtual_timer_interval_ns as u64,
-                    )
-                }
-                ITIMER_PROF => {
-                    if signals.prof_timer_armed_seq != armed_seq
-                        || signals.prof_timer_deadline_ns == 0
-                    {
-                        return;
+                    ITIMER_PROF => {
+                        if signals.prof_timer_armed_seq != armed_seq
+                            || signals.prof_timer_deadline_ns == 0
+                        {
+                            return;
+                        }
+                        (
+                            signals.prof_timer_deadline_ns as u64,
+                            signals.prof_timer_interval_ns as u64,
+                        )
                     }
-                    (
-                        signals.prof_timer_deadline_ns as u64,
-                        signals.prof_timer_interval_ns as u64,
-                    )
+                    _ => return,
                 }
-                _ => return,
-            }
-        };
+            };
 
-        let now_cpu_ns = process_itimer_clock_ns(proc_id, which) as u64;
-        if now_cpu_ns < deadline_ns {
-            let sleep_ns = deadline_ns.saturating_sub(now_cpu_ns).min(1_000_000);
-            axtask::sleep(core::time::Duration::from_nanos(sleep_ns.max(1)));
-            continue;
-        }
-
-        let periodic = {
-            let now_cpu_ns = process_itimer_clock_ns(proc_id, which);
-            let mut signals = owner.task_ext().signals.lock();
-            match which {
-                ITIMER_VIRTUAL => {
-                    if signals.virtual_timer_armed_seq != armed_seq
-                        || signals.virtual_timer_deadline_ns == 0
-                    {
-                        return;
-                    }
-                    if now_cpu_ns < signals.virtual_timer_deadline_ns {
-                        true
-                    } else if signals.virtual_timer_interval_ns == 0 {
-                        signals.virtual_timer_deadline_ns = 0;
-                        false
-                    } else {
-                        let overdue = now_cpu_ns - signals.virtual_timer_deadline_ns;
-                        let steps = overdue / signals.virtual_timer_interval_ns + 1;
-                        signals.virtual_timer_deadline_ns +=
-                            steps * signals.virtual_timer_interval_ns;
-                        true
-                    }
-                }
-                ITIMER_PROF => {
-                    if signals.prof_timer_armed_seq != armed_seq
-                        || signals.prof_timer_deadline_ns == 0
-                    {
-                        return;
-                    }
-                    if now_cpu_ns < signals.prof_timer_deadline_ns {
-                        true
-                    } else if signals.prof_timer_interval_ns == 0 {
-                        signals.prof_timer_deadline_ns = 0;
-                        false
-                    } else {
-                        let overdue = now_cpu_ns - signals.prof_timer_deadline_ns;
-                        let steps = overdue / signals.prof_timer_interval_ns + 1;
-                        signals.prof_timer_deadline_ns += steps * signals.prof_timer_interval_ns;
-                        true
-                    }
-                }
-                _ => return,
+            let now_cpu_ns = process_itimer_clock_ns(proc_id, which) as u64;
+            if now_cpu_ns < deadline_ns {
+                let sleep_ns = deadline_ns.saturating_sub(now_cpu_ns).min(1_000_000);
+                axtask::sleep(core::time::Duration::from_nanos(sleep_ns.max(1)));
+                continue;
             }
-        };
 
-        queue_signal_and_wake(&owner, itimer_signal(which), None);
-        if trace_setitimer01_task(&owner) {
-            if let Some(slot) = take_setitimer_diag_slot() {
-                warn!(
-                    "[setitimer-diag:{}] fire kind={} owner_tid={} owner_pid={} seq={} periodic={}",
-                    slot,
-                    which,
-                    owner.id().as_u64(),
-                    owner.task_ext().proc_id,
-                    armed_seq,
-                    periodic,
-                );
+            let periodic = {
+                let now_cpu_ns = process_itimer_clock_ns(proc_id, which);
+                let mut signals = owner.task_ext().signals.lock();
+                match which {
+                    ITIMER_VIRTUAL => {
+                        if signals.virtual_timer_armed_seq != armed_seq
+                            || signals.virtual_timer_deadline_ns == 0
+                        {
+                            return;
+                        }
+                        if now_cpu_ns < signals.virtual_timer_deadline_ns {
+                            true
+                        } else if signals.virtual_timer_interval_ns == 0 {
+                            signals.virtual_timer_deadline_ns = 0;
+                            false
+                        } else {
+                            let overdue = now_cpu_ns - signals.virtual_timer_deadline_ns;
+                            let steps = overdue / signals.virtual_timer_interval_ns + 1;
+                            signals.virtual_timer_deadline_ns +=
+                                steps * signals.virtual_timer_interval_ns;
+                            true
+                        }
+                    }
+                    ITIMER_PROF => {
+                        if signals.prof_timer_armed_seq != armed_seq
+                            || signals.prof_timer_deadline_ns == 0
+                        {
+                            return;
+                        }
+                        if now_cpu_ns < signals.prof_timer_deadline_ns {
+                            true
+                        } else if signals.prof_timer_interval_ns == 0 {
+                            signals.prof_timer_deadline_ns = 0;
+                            false
+                        } else {
+                            let overdue = now_cpu_ns - signals.prof_timer_deadline_ns;
+                            let steps = overdue / signals.prof_timer_interval_ns + 1;
+                            signals.prof_timer_deadline_ns +=
+                                steps * signals.prof_timer_interval_ns;
+                            true
+                        }
+                    }
+                    _ => return,
+                }
+            };
+
+            queue_signal_and_wake(&owner, itimer_signal(which), None);
+            if trace_setitimer01_task(&owner) {
+                if let Some(slot) = take_setitimer_diag_slot() {
+                    warn!(
+                        "[setitimer-diag:{}] fire kind={} owner_tid={} owner_pid={} seq={} periodic={}",
+                        slot,
+                        which,
+                        owner.id().as_u64(),
+                        owner.task_ext().proc_id,
+                        armed_seq,
+                        periodic,
+                    );
+                }
             }
-        }
-        if !periodic {
-            return;
-        }
-    }, "signal-cpu-itimer".into(), SIGNAL_WORKER_STACK_SIZE);
+            if !periodic {
+                return;
+            }
+        },
+        "signal-cpu-itimer".into(),
+        SIGNAL_WORKER_STACK_SIZE,
+    );
 }
 
 fn spawn_posix_timer_worker(owner: &AxTaskRef, timer_id: i32, armed_seq: u64) {
     let owner = Arc::downgrade(owner);
-    axtask::spawn_raw(move || loop {
-        let Some(owner) = owner.upgrade() else {
-            return;
-        };
-        if trace_clock_settime03_task(&owner) {
-            warn!(
-                "[clock_settime03-worker] state=start owner_tid={} owner_pid={} timerid={} seq={}",
-                owner.id().as_u64(),
-                owner.task_ext().proc_id,
-                timer_id,
-                armed_seq
-            );
-        }
-
-        let deadline_ns = {
-            let signals = owner.task_ext().signals.lock();
-            let Some(timer) = signals.posix_timers.get(&timer_id) else {
+    axtask::spawn_raw(
+        move || loop {
+            let Some(owner) = owner.upgrade() else {
                 return;
             };
-            if timer.armed_seq != armed_seq || timer.deadline_ns == 0 {
-                return;
-            }
-            timer.deadline_ns
-        };
-
-        let now_ns = monotonic_time_nanos();
-        if now_ns < deadline_ns {
-            let sleep_ns = deadline_ns.saturating_sub(now_ns);
             if trace_clock_settime03_task(&owner) {
                 warn!(
+                    "[clock_settime03-worker] state=start owner_tid={} owner_pid={} timerid={} seq={}",
+                    owner.id().as_u64(),
+                    owner.task_ext().proc_id,
+                    timer_id,
+                    armed_seq
+                );
+            }
+
+            let deadline_ns = {
+                let signals = owner.task_ext().signals.lock();
+                let Some(timer) = signals.posix_timers.get(&timer_id) else {
+                    return;
+                };
+                if timer.armed_seq != armed_seq || timer.deadline_ns == 0 {
+                    return;
+                }
+                timer.deadline_ns
+            };
+
+            let now_ns = monotonic_time_nanos();
+            if now_ns < deadline_ns {
+                let sleep_ns = deadline_ns.saturating_sub(now_ns);
+                if trace_clock_settime03_task(&owner) {
+                    warn!(
                         "[clock_settime03-worker] state=sleep owner_tid={} owner_pid={} timerid={} seq={} now_ns={} deadline_ns={} sleep_ns={}",
                         owner.id().as_u64(),
                         owner.task_ext().proc_id,
@@ -1352,13 +1364,13 @@ fn spawn_posix_timer_worker(owner: &AxTaskRef, timer_id: i32, armed_seq: u64) {
                         deadline_ns,
                         sleep_ns
                     );
+                }
+                axtask::sleep(core::time::Duration::from_nanos(sleep_ns));
             }
-            axtask::sleep(core::time::Duration::from_nanos(sleep_ns));
-        }
 
-        let now_ns = monotonic_time_nanos();
-        if trace_clock_settime03_task(&owner) {
-            warn!(
+            let now_ns = monotonic_time_nanos();
+            if trace_clock_settime03_task(&owner) {
+                warn!(
                     "[clock_settime03-worker] state=wake owner_tid={} owner_pid={} timerid={} seq={} now_ns={}",
                     owner.id().as_u64(),
                     owner.task_ext().proc_id,
@@ -1366,44 +1378,47 @@ fn spawn_posix_timer_worker(owner: &AxTaskRef, timer_id: i32, armed_seq: u64) {
                     armed_seq,
                     now_ns
                 );
-        }
-        let expired = {
-            let mut signals = owner.task_ext().signals.lock();
-            let Some(timer) = signals.posix_timers.get_mut(&timer_id) else {
-                return;
-            };
-            if timer.armed_seq != armed_seq || timer.deadline_ns == 0 {
-                return;
             }
-            if now_ns < timer.deadline_ns {
-                None
-            } else {
-                let notify = timer.notify;
-                let signum = timer.notify_signum;
-                let notify_tid = timer.notify_tid;
-                if timer.interval_ns == 0 {
-                    timer.deadline_ns = 0;
-                    timer.overrun = 0;
-                } else {
-                    let overdue = now_ns - timer.deadline_ns;
-                    let steps = overdue / timer.interval_ns + 1;
-                    timer.deadline_ns = timer
-                        .deadline_ns
-                        .saturating_add(steps.saturating_mul(timer.interval_ns));
-                    timer.overrun = steps.saturating_sub(1).min(u32::MAX as u64) as u32;
+            let expired = {
+                let mut signals = owner.task_ext().signals.lock();
+                let Some(timer) = signals.posix_timers.get_mut(&timer_id) else {
+                    return;
+                };
+                if timer.armed_seq != armed_seq || timer.deadline_ns == 0 {
+                    return;
                 }
-                Some((notify, signum, notify_tid, timer.interval_ns != 0))
-            }
-        };
+                if now_ns < timer.deadline_ns {
+                    None
+                } else {
+                    let notify = timer.notify;
+                    let signum = timer.notify_signum;
+                    let notify_tid = timer.notify_tid;
+                    if timer.interval_ns == 0 {
+                        timer.deadline_ns = 0;
+                        timer.overrun = 0;
+                    } else {
+                        let overdue = now_ns - timer.deadline_ns;
+                        let steps = overdue / timer.interval_ns + 1;
+                        timer.deadline_ns = timer
+                            .deadline_ns
+                            .saturating_add(steps.saturating_mul(timer.interval_ns));
+                        timer.overrun = steps.saturating_sub(1).min(u32::MAX as u64) as u32;
+                    }
+                    Some((notify, signum, notify_tid, timer.interval_ns != 0))
+                }
+            };
 
-        let Some((notify, signum, notify_tid, periodic)) = expired else {
-            continue;
-        };
-        queue_posix_timer_signal(&owner, notify, signum, notify_tid);
-        if !periodic {
-            return;
-        }
-    }, "signal-posix-timer".into(), SIGNAL_WORKER_STACK_SIZE);
+            let Some((notify, signum, notify_tid, periodic)) = expired else {
+                continue;
+            };
+            queue_posix_timer_signal(&owner, notify, signum, notify_tid);
+            if !periodic {
+                return;
+            }
+        },
+        "signal-posix-timer".into(),
+        SIGNAL_WORKER_STACK_SIZE,
+    );
 }
 
 fn thread_group_next_posix_timer_deadline(proc_id: usize) -> Option<u64> {
@@ -1421,6 +1436,10 @@ fn thread_group_next_posix_timer_deadline(proc_id: usize) -> Option<u64> {
         }
     }
     next_deadline
+}
+
+fn needs_old_musl_sigtimedwait_retry_quirk(task: &AxTaskRef) -> bool {
+    task.task_ext().exec_path().starts_with("/musl/")
 }
 
 fn trace_clock_settime03() -> bool {
@@ -1479,6 +1498,82 @@ fn take_thread_group_pending_signal(
     }
 
     None
+}
+
+fn pending_info_is_thread_directed(signals: &SignalState, signum: usize) -> bool {
+    signals.pending_info[signum - 1]
+        .map(|info| info.si_code == SI_TKILL)
+        .unwrap_or(false)
+}
+
+fn move_thread_group_interrupting_signal_to_current(
+    curr: &AxTaskRef,
+    ignored_mask: u64,
+    now_ns: usize,
+    deliver: bool,
+) -> bool {
+    let current_mask = {
+        let signals = curr.task_ext().signals.lock();
+        signals.blocked_mask
+    };
+
+    for task in thread_group_tasks(curr.task_ext().proc_id) {
+        let is_current = task.id().as_u64() == curr.id().as_u64();
+        let mut signals = task.task_ext().signals.lock();
+        refresh_timers(&mut signals, now_ns);
+        let mut ready = signals.pending_mask & !current_mask & !ignored_mask;
+
+        while ready != 0 {
+            let signum = ready.trailing_zeros() as usize + 1;
+            let bit = SignalState::signal_bit(signum);
+            ready &= !bit;
+
+            if !is_current && pending_info_is_thread_directed(&signals, signum) {
+                continue;
+            }
+            if matches!(signum, SIGKILL | SIGSTOP) {
+                if is_current {
+                    return true;
+                }
+                let siginfo = signals.take_pending_info(signum);
+                signals.pending_mask &= !bit;
+                drop(signals);
+                curr.task_ext()
+                    .signals
+                    .lock()
+                    .queue_signal(signum, Some(siginfo));
+                return true;
+            }
+
+            let action = signals.action(signum);
+            if action.handler == SIG_IGN {
+                continue;
+            }
+            if action.handler == SIG_DFL && signal_default_ignored(signum) {
+                continue;
+            }
+
+            if is_current {
+                if !deliver {
+                    let _ = signals.take_pending_info(signum);
+                    signals.pending_mask &= !bit;
+                }
+                return true;
+            }
+            let siginfo = signals.take_pending_info(signum);
+            signals.pending_mask &= !bit;
+            drop(signals);
+            if deliver {
+                curr.task_ext()
+                    .signals
+                    .lock()
+                    .queue_signal(signum, Some(siginfo));
+            }
+            return true;
+        }
+    }
+
+    false
 }
 
 fn prepare_signal_delivery() -> Option<PreparedSignal> {
@@ -1858,7 +1953,8 @@ pub(crate) fn dispatch_current_signals(tf: &mut TrapFrame) {
 }
 
 fn exit_current_for_signal(status: i32) -> ! {
-    crate::task::exit_current_task(status, true, true);
+    let signum = (status & 0x7f) as usize;
+    crate::task::exit_current_thread_group_for_signal(signum, status);
 }
 
 fn stop_current_for_signal(signum: usize) {
@@ -2108,8 +2204,8 @@ pub(crate) fn send_user_signal_to_task(
         let signals = task.task_ext().signals.lock();
         signals.action(signum)
     };
-    let broadcast_group = signum == SIGKILL
-        || (action.handler == SIG_DFL && signal_default_terminates(signum));
+    let broadcast_group =
+        signum == SIGKILL || (action.handler == SIG_DFL && signal_default_terminates(signum));
     if broadcast_group {
         for member in thread_group_tasks(task.task_ext().proc_id) {
             queue_signal_and_wake(&member, signum, Some(siginfo));
@@ -2169,7 +2265,6 @@ pub(crate) fn sys_rt_sigaction(
         }
 
         let curr = current();
-        let mut debug_loops = 0usize;
         if !oldact.is_null() {
             let signals = curr.task_ext().signals.lock();
             let action = signals.action(signum);
@@ -2258,20 +2353,20 @@ pub(crate) fn sys_rt_sigsuspend(set: *const c_void, _sigsetsize: usize) -> isize
         let mut debug_loops = 0usize;
 
         loop {
-            let interrupted = {
-                let now_ns = current_now_ns();
-                let mut signals = curr.task_ext().signals.lock();
-                refresh_timers(&mut signals, now_ns);
-                has_interrupting_pending_signal(&signals, false)
-            };
+            let now_ns = current_now_ns();
+            let interrupted = move_thread_group_interrupting_signal_to_current(
+                curr.as_task_ref(),
+                0,
+                now_ns,
+                true,
+            );
             if interrupted {
                 return Err::<isize, LinuxError>(LinuxError::EINTR);
             }
             if let Some(next_timer_deadline) =
                 thread_group_next_posix_timer_deadline(curr.task_ext().proc_id)
             {
-                let now_ns = current_now_ns() as u64;
-                if next_timer_deadline.saturating_sub(now_ns) <= 5 * NANOS_PER_SEC {
+                if next_timer_deadline.saturating_sub(now_ns as u64) <= 5 * NANOS_PER_SEC {
                     core::hint::spin_loop();
                     continue;
                 }
@@ -2331,11 +2426,20 @@ pub(crate) fn sys_rt_sigtimedwait(
             }
 
             let interrupted = {
-                let mut signals = curr.task_ext().signals.lock();
-                refresh_timers(&mut signals, now_ns);
-                has_interrupting_pending_signal_with_ignored_mask(&signals, false, wait_mask)
+                move_thread_group_interrupting_signal_to_current(
+                    curr.as_task_ref(),
+                    wait_mask,
+                    now_ns,
+                    false,
+                )
             };
             if interrupted {
+                if wait_mask == 0
+                    && deadline_ns.is_none()
+                    && needs_old_musl_sigtimedwait_retry_quirk(curr.as_task_ref())
+                {
+                    return Err(LinuxError::EAGAIN);
+                }
                 return Err(LinuxError::EINTR);
             }
 
