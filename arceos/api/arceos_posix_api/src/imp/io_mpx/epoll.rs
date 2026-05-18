@@ -172,12 +172,18 @@ impl EpollInstance {
         fd: usize,
         event: &ctypes::epoll_event,
     ) -> LinuxResult<usize> {
-        if !fd_supports_epoll(fd as c_int)? {
-            return Err(LinuxError::EPERM);
-        }
-        let stored_event = read_epoll_event(event);
         match op as u32 {
             ctypes::EPOLL_CTL_ADD => {
+                {
+                    let events = self.events.lock();
+                    if events.contains_key(&fd) {
+                        return Err(LinuxError::EEXIST);
+                    }
+                }
+                if !fd_supports_epoll(fd as c_int)? {
+                    return Err(LinuxError::EPERM);
+                }
+                let stored_event = read_epoll_event(event);
                 get_file_like(fd as c_int)?;
                 self.validate_add_target(epfd, fd as c_int)?;
                 if let Entry::Vacant(e) = self.events.lock().entry(fd) {
@@ -187,7 +193,7 @@ impl EpollInstance {
                 }
             }
             ctypes::EPOLL_CTL_MOD => {
-                get_file_like(fd as c_int)?;
+                let stored_event = read_epoll_event(event);
                 let mut events = self.events.lock();
                 if let Entry::Occupied(mut ocp) = events.entry(fd) {
                     ocp.insert(stored_event);
@@ -196,7 +202,6 @@ impl EpollInstance {
                 }
             }
             ctypes::EPOLL_CTL_DEL => {
-                get_file_like(fd as c_int)?;
                 let mut events = self.events.lock();
                 if let Entry::Occupied(ocp) = events.entry(fd) {
                     ocp.remove_entry();
