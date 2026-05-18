@@ -15,10 +15,20 @@ mod tests;
 pub use self::dir::DirNode;
 pub use self::file::FileNode;
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use axfs_vfs::{VfsNodeRef, VfsOps, VfsResult};
 use core::sync::atomic::{AtomicUsize, Ordering};
-use spin::once::Once;
+use spin::{Mutex, once::Once};
+
+static RAMFS_QUOTAS: Mutex<Vec<Weak<FsQuota>>> = Mutex::new(Vec::new());
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RamFsQuotaStats {
+    pub live_filesystems: usize,
+    pub used_bytes: usize,
+    pub max_bytes: usize,
+}
 
 pub(crate) struct FsQuota {
     max_bytes: Option<usize>,
@@ -56,6 +66,29 @@ impl FsQuota {
             self.used_bytes.fetch_sub(bytes, Ordering::AcqRel);
         }
     }
+
+    fn used_bytes(&self) -> usize {
+        self.used_bytes.load(Ordering::Acquire)
+    }
+}
+
+fn register_quota(quota: &Arc<FsQuota>) {
+    RAMFS_QUOTAS.lock().push(Arc::downgrade(quota));
+}
+
+pub fn diagnostic_quota_usage() -> RamFsQuotaStats {
+    let mut stats = RamFsQuotaStats::default();
+    let mut quotas = RAMFS_QUOTAS.lock();
+    quotas.retain(|quota| {
+        let Some(quota) = quota.upgrade() else {
+            return false;
+        };
+        stats.live_filesystems += 1;
+        stats.used_bytes += quota.used_bytes();
+        stats.max_bytes += quota.max_bytes.unwrap_or(0);
+        true
+    });
+    stats
 }
 
 /// A RAM filesystem that implements [`axfs_vfs::VfsOps`].
@@ -72,6 +105,7 @@ impl RamFileSystem {
 
     pub fn new_with_max_bytes(max_bytes: Option<usize>) -> Self {
         let quota = Arc::new(FsQuota::new(max_bytes));
+        register_quota(&quota);
         Self {
             parent: Once::new(),
             root: DirNode::new(None, quota),

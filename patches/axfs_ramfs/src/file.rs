@@ -1,8 +1,6 @@
-use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
-use alloc::vec;
-use axalloc::global_allocator;
+use axalloc::{GlobalPage, global_allocator};
 use axfs_vfs::{
     impl_vfs_non_dir_default, VfsNodeAttr, VfsNodeOps, VfsNodePerm, VfsNodeType, VfsResult,
 };
@@ -17,7 +15,7 @@ const MIN_ALLOCATOR_RESERVE_PAGES: usize = 64;
 static LARGE_RAMFS_WRITE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 struct FileContent {
-    chunks: BTreeMap<usize, Box<[u8]>>,
+    chunks: BTreeMap<usize, GlobalPage>,
     reserved_chunks: BTreeSet<usize>,
     len: usize,
 }
@@ -50,18 +48,25 @@ impl FileContent {
     }
 
     fn ensure_chunk_allocated(&mut self, chunk_idx: usize) -> VfsResult<&mut [u8]> {
+        let was_reserved = self.reserved_chunks.remove(&chunk_idx);
         if !self.chunks.contains_key(&chunk_idx) {
             Self::ensure_allocator_headroom(1)?;
+            let page = match GlobalPage::alloc_zero() {
+                Ok(page) => page,
+                Err(_) => {
+                    if was_reserved {
+                        self.reserved_chunks.insert(chunk_idx);
+                    }
+                    return Err(axfs_vfs::VfsError::StorageFull);
+                }
+            };
+            self.chunks.insert(chunk_idx, page);
         }
-        let was_reserved = self.reserved_chunks.remove(&chunk_idx);
-        let entry = self.chunks.entry(chunk_idx).or_insert_with(|| {
-            vec![0; CHUNK_SIZE].into_boxed_slice()
-        });
-        if was_reserved && entry.len() != CHUNK_SIZE {
-            self.reserved_chunks.insert(chunk_idx);
-            return Err(axfs_vfs::VfsError::StorageFull);
-        }
-        Ok(entry.as_mut())
+        Ok(self
+            .chunks
+            .get_mut(&chunk_idx)
+            .expect("ramfs chunk must exist after allocation")
+            .as_slice_mut())
     }
 
     fn zero_range(&mut self, start: usize, end: usize) {
@@ -74,7 +79,7 @@ impl FileContent {
             let within_chunk = pos % CHUNK_SIZE;
             let chunk_end = ((chunk_idx + 1) * CHUNK_SIZE).min(end);
             if let Some(chunk) = self.chunks.get_mut(&chunk_idx) {
-                chunk[within_chunk..within_chunk + (chunk_end - pos)].fill(0);
+                chunk.as_slice_mut()[within_chunk..within_chunk + (chunk_end - pos)].fill(0);
             }
             pos = chunk_end;
         }
@@ -236,7 +241,7 @@ impl VfsNodeOps for FileNode {
             let chunk_end = ((chunk_idx + 1) * CHUNK_SIZE).min(end);
             let dst = &mut buf[dst_pos..dst_pos + (chunk_end - read_pos)];
             if let Some(chunk) = content.chunks.get(&chunk_idx) {
-                dst.copy_from_slice(&chunk[within_chunk..within_chunk + dst.len()]);
+                dst.copy_from_slice(&chunk.as_slice()[within_chunk..within_chunk + dst.len()]);
             } else {
                 dst.fill(0);
             }
@@ -249,7 +254,9 @@ impl VfsNodeOps for FileNode {
     fn write_at(&self, offset: u64, buf: &[u8]) -> VfsResult<usize> {
         let offset = offset as usize;
         let mut content = self.content.write();
-        let end = offset + buf.len();
+        let end = offset
+            .checked_add(buf.len())
+            .ok_or(axfs_vfs::VfsError::InvalidInput)?;
         if end >= (1 << 20) && !LARGE_RAMFS_WRITE_LOGGED.swap(true, Ordering::Relaxed) {
             log::warn!(
                 "ramfs large write path offset={} len={} end={} chunks={}",
@@ -258,6 +265,11 @@ impl VfsNodeOps for FileNode {
                 end,
                 FileContent::chunk_count_for_len(end)
             );
+        }
+        if buf.iter().all(|byte| *byte == 0) {
+            content.zero_range(offset, end);
+            content.len = content.len.max(end);
+            return Ok(buf.len());
         }
         let start_chunk = offset / CHUNK_SIZE;
         let end_chunk = end.div_ceil(CHUNK_SIZE);
