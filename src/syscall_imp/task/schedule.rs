@@ -153,6 +153,23 @@ fn scheduler_time_slice_for_task(policy: i32, nice: i32) -> usize {
     }
 }
 
+fn policy_uses_realtime_priority(policy: i32) -> bool {
+    matches!(policy, SCHED_FIFO | SCHED_RR)
+}
+
+fn apply_task_nice(task: &axtask::AxTaskRef, target_nice: i32) -> Result<bool, LinuxError> {
+    let policy = task.task_ext().schedule_policy();
+    let sched_priority =
+        scheduler_priority_for_task(policy, task.task_ext().schedule_priority(), target_nice);
+    let scheduler_accepted = axtask::set_task_priority(task, sched_priority);
+    if !scheduler_accepted && policy_uses_realtime_priority(policy) {
+        return Err(LinuxError::EINVAL);
+    }
+    let _ = axtask::set_task_time_slice(task, scheduler_time_slice_for_task(policy, target_nice));
+    task.task_ext().set_nice(target_nice);
+    Ok(scheduler_accepted)
+}
+
 fn apply_sched_state(task: &axtask::AxTaskRef, policy: i32, priority: i32, reset_on_fork: bool) {
     task.task_ext()
         .set_sched_state(policy, priority, reset_on_fork);
@@ -266,27 +283,14 @@ pub(crate) fn sys_setpriority(which: i32, who: i32, prio: i32) -> isize {
         if target_nice < current_nice && axfs::api::current_euid() != 0 {
             return Err(LinuxError::EPERM);
         }
-        if !axtask::set_task_priority(
-            &task,
-            scheduler_priority_for_task(
-                task.task_ext().schedule_policy(),
-                task.task_ext().schedule_priority(),
-                target_nice,
-            ),
-        ) {
-            return Err(LinuxError::EINVAL);
-        }
-        let _ = axtask::set_task_time_slice(
-            &task,
-            scheduler_time_slice_for_task(task.task_ext().schedule_policy(), target_nice),
-        );
-        task.task_ext().set_nice(target_nice);
+        let scheduler_accepted = apply_task_nice(&task, target_nice)?;
         if let Some(slot) = diag_slot {
             warn!(
-                "[nice05-diag:{}] syscall=setpriority applied target_tid={} applied_nice={}",
+                "[nice05-diag:{}] syscall=setpriority applied target_tid={} applied_nice={} scheduler_accepted={}",
                 slot,
                 task.id().as_u64(),
                 task.task_ext().nice(),
+                scheduler_accepted,
             );
         }
         Ok(0)
