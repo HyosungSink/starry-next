@@ -569,6 +569,20 @@ fn futex_wait(
     }
 
     state.waiters.fetch_add(1, Ordering::AcqRel);
+    let queued_value = match read_value_from_user(uaddr) {
+        Ok(value) => value,
+        Err(err) => {
+            state.waiters.fetch_sub(1, Ordering::AcqRel);
+            maybe_remove_futex_state(key, &state);
+            return Err(err);
+        }
+    };
+    if queued_value != val {
+        state.waiters.fetch_sub(1, Ordering::AcqRel);
+        maybe_remove_futex_state(key, &state);
+        return Err(LinuxError::EAGAIN);
+    }
+
     let mut timed_out = false;
     let wait_done = || {
         crate::signal::current_has_pending_signal()
